@@ -37,6 +37,45 @@ describe('AwsProvider', () => {
   });
   afterEach(() => restoreEnv());
 
+  describe('runtime schema parity', () => {
+    it('should keep `awsLambdaRuntime` in sync with `AwsLambdaRuntime`', () => {
+      const localServerless = new Serverless({ ...options, commands: [], options: {} });
+      const runtimeTypePath = path.resolve(__dirname, '../../../../../types/index.d.ts');
+      const runtimeTypeSource = fs.readFileSync(runtimeTypePath, 'utf8');
+
+      localServerless.service.provider.name = 'aws';
+      localServerless.cli = new localServerless.classes.CLI();
+      const localAwsProvider = new AwsProvider(localServerless, options);
+      expect(localAwsProvider.serverless).to.equal(localServerless);
+
+      const runtimeTypeMatch = runtimeTypeSource.match(
+        /export type AwsLambdaRuntime\s*=\s*([\s\S]*?);/
+      );
+
+      if (!runtimeTypeMatch) {
+        throw new Error('Could not find AwsLambdaRuntime type declaration');
+      }
+
+      const providerRuntimes = [
+        ...localServerless.configSchemaHandler.schema.definitions.awsLambdaRuntime.enum,
+      ].sort();
+      const typeRuntimes = [...runtimeTypeMatch[1].matchAll(/'([^']+)'/g)]
+        .map((match) => match[1])
+        .sort();
+      const missingInTypes = providerRuntimes.filter((runtime) => !typeRuntimes.includes(runtime));
+      const missingInProvider = typeRuntimes.filter(
+        (runtime) => !providerRuntimes.includes(runtime)
+      );
+
+      expect(
+        providerRuntimes,
+        `awsLambdaRuntime mismatch:\nmissing in types: ${
+          missingInTypes.join(', ') || 'none'
+        }\nmissing in provider: ${missingInProvider.join(', ') || 'none'}`
+      ).to.deep.equal(typeRuntimes);
+    });
+  });
+
   describe('#constructor()', () => {
     it('should set Serverless instance', () => {
       expect(typeof awsProvider.serverless).to.not.equal('undefined');
