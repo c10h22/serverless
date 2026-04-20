@@ -7,8 +7,8 @@ const path = require('path');
 const _ = require('lodash');
 const isPlainObject = require('type/plain-object/is');
 const yaml = require('js-yaml');
-const cloudformationSchema = require('@serverless/utils/cloudformation-schema');
-const { log, progress, style } = require('@serverless/utils/log');
+const cloudformationSchema = require('../lib/utils/serverless-utils/cloudformation-schema');
+const { log, progress, style } = require('../lib/utils/serverless-utils/log');
 const ServerlessError = require('../lib/serverless-error');
 const yamlAstParser = require('../lib/utils/yaml-ast-parser');
 const npmCommandDeferred = require('../lib/utils/npm-command-deferred');
@@ -37,9 +37,9 @@ module.exports = async ({ configuration, serviceDir, configurationFilename, opti
   await installPlugin(context);
   // Check if plugin is already added
   const pluginAlreadyPresentInConfig =
-    (_.get(configuration, 'plugins.modules') &&
-      configuration.plugin.modules.includes(pluginName)) ||
-    (configuration.plugins && configuration.plugins.includes(pluginName));
+    (Array.isArray(_.get(configuration, 'plugins.modules')) &&
+      configuration.plugins.modules.includes(pluginName)) ||
+    (Array.isArray(configuration.plugins) && configuration.plugins.includes(pluginName));
   if (!pluginAlreadyPresentInConfig) {
     await addPluginToServerlessFile(context);
   }
