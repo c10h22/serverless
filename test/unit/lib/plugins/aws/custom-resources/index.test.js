@@ -406,6 +406,25 @@ describe('#addCustomResourceToService()', () => {
       Resources.CustomDashresourceDasheventDashbridgeLambdaFunction.Properties.Runtime
     ).to.equal('nodejs24.x');
   });
+
+  it('should set Architectures from provider.architecture', async () => {
+    serverless.service.provider.architecture = 'arm64';
+    await addCustomResourceToService(provider, 's3', iamRoleStatements);
+
+    const { Resources } = serverless.service.provider.compiledCloudFormationTemplate;
+    expect(
+      Resources.CustomDashresourceDashexistingDashs3LambdaFunction.Properties.Architectures
+    ).to.deep.equal(['arm64']);
+  });
+
+  it('should not set Architectures when provider.architecture is not defined', async () => {
+    await addCustomResourceToService(provider, 's3', iamRoleStatements);
+
+    const { Resources } = serverless.service.provider.compiledCloudFormationTemplate;
+    expect(
+      Resources.CustomDashresourceDashexistingDashs3LambdaFunction.Properties
+    ).to.not.have.property('Architectures');
+  });
 });
 
 describe('test/unit/lib/plugins/aws/customResources/index.test.js', () => {
