@@ -116,4 +116,178 @@ describe('serverless-utils/download', () => {
 
     expect(await fsp.readFile(path.join(tmpDir, 'file.txt'), 'utf8')).to.equal('fixture');
   });
+
+  it('preserves authorization across approved redirect hostnames', async () => {
+    let initialAuthorization;
+    let redirectedAuthorization;
+
+    const redirectedServer = http.createServer((req, res) => {
+      redirectedAuthorization = req.headers.authorization;
+      res.statusCode = 200;
+      res.end('redirected payload');
+    });
+
+    await new Promise((resolve) => redirectedServer.listen(0, '127.0.0.1', resolve));
+
+    const redirectingServer = http.createServer((req, res) => {
+      initialAuthorization = req.headers.authorization;
+      res.statusCode = 302;
+      res.setHeader('Location', `http://127.0.0.1:${redirectedServer.address().port}/final`);
+      res.end();
+    });
+
+    await new Promise((resolve) => redirectingServer.listen(0, '127.0.0.1', resolve));
+
+    try {
+      const result = await download(`http://127.0.0.1:${redirectingServer.address().port}/start`, {
+        responseType: 'text',
+        username: 'user',
+        password: 'pass',
+        allowedAuthRedirectHostnames: ['127.0.0.1'],
+      });
+
+      expect(result).to.equal('redirected payload');
+      expect(initialAuthorization).to.equal('Basic dXNlcjpwYXNz');
+      expect(redirectedAuthorization).to.equal('Basic dXNlcjpwYXNz');
+    } finally {
+      await Promise.all([
+        new Promise((resolve, reject) => {
+          redirectingServer.close((error) => {
+            if (error) {
+              reject(error);
+              return;
+            }
+
+            resolve();
+          });
+        }),
+        new Promise((resolve, reject) => {
+          redirectedServer.close((error) => {
+            if (error) {
+              reject(error);
+              return;
+            }
+
+            resolve();
+          });
+        }),
+      ]);
+    }
+  });
+
+  it('normalizes and strips capitalized Authorization headers on disallowed cross-origin redirects', async () => {
+    let initialAuthorization;
+    let redirectedAuthorization;
+
+    const redirectedServer = http.createServer((req, res) => {
+      redirectedAuthorization = req.headers.authorization;
+      res.statusCode = 200;
+      res.end('redirected payload');
+    });
+
+    await new Promise((resolve) => redirectedServer.listen(0, '127.0.0.1', resolve));
+
+    const redirectingServer = http.createServer((req, res) => {
+      initialAuthorization = req.headers.authorization;
+      res.statusCode = 302;
+      res.setHeader('Location', `http://127.0.0.1:${redirectedServer.address().port}/final`);
+      res.end();
+    });
+
+    await new Promise((resolve) => redirectingServer.listen(0, '127.0.0.1', resolve));
+
+    try {
+      const result = await download(`http://127.0.0.1:${redirectingServer.address().port}/start`, {
+        responseType: 'text',
+        headers: {
+          Authorization: '\tBearer token\t',
+        },
+      });
+
+      expect(result).to.equal('redirected payload');
+      expect(initialAuthorization).to.equal('Bearer token');
+      expect(redirectedAuthorization).to.equal(undefined);
+    } finally {
+      await Promise.all([
+        new Promise((resolve, reject) => {
+          redirectingServer.close((error) => {
+            if (error) {
+              reject(error);
+              return;
+            }
+
+            resolve();
+          });
+        }),
+        new Promise((resolve, reject) => {
+          redirectedServer.close((error) => {
+            if (error) {
+              reject(error);
+              return;
+            }
+
+            resolve();
+          });
+        }),
+      ]);
+    }
+  });
+
+  it('cancels redirect bodies before following the next hop', async () => {
+    const originalFetch = globalThis.fetch;
+    const events = [];
+
+    const redirectBody = {
+      cancel: async () => {
+        events.push('cancel-redirect');
+      },
+    };
+    const finalBody = {
+      cancel: async () => {
+        events.push('cancel-final');
+      },
+    };
+
+    globalThis.fetch = async (url) => {
+      if (String(url) === 'http://example.com/start') {
+        events.push('fetch-redirect');
+        return {
+          status: 302,
+          headers: new globalThis.Headers({ location: 'http://example.com/final' }),
+          body: redirectBody,
+        };
+      }
+
+      if (String(url) === 'http://example.com/final') {
+        events.push('fetch-final');
+        return {
+          ok: true,
+          status: 200,
+          url: 'http://example.com/final',
+          headers: new globalThis.Headers({ 'content-type': 'text/plain' }),
+          body: finalBody,
+          arrayBuffer: async () => {
+            events.push('read-final');
+            return Buffer.from('ok');
+          },
+        };
+      }
+
+      throw new Error(`Unexpected fetch URL: ${String(url)}`);
+    };
+
+    try {
+      const result = await download('http://example.com/start', { responseType: 'text' });
+
+      expect(result).to.equal('ok');
+      expect(events).to.deep.equal([
+        'fetch-redirect',
+        'cancel-redirect',
+        'fetch-final',
+        'read-final',
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

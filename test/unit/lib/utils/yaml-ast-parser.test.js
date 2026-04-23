@@ -163,6 +163,23 @@ describe('#yamlAstParser', () => {
       return addNewArrayItemAndVerifyResult(yamlContent, 'toplevel', 'foo', expectedResult);
     });
 
+    it('should add an item under a quoted top level key', () => {
+      const yamlContent = [
+        '"plugins":',
+        '  - existing-plugin',
+        'custom:',
+        '  taggedValue: keep-me',
+      ].join('\n');
+      const expectedResult = {
+        plugins: ['existing-plugin', 'foo'],
+        custom: {
+          taggedValue: 'keep-me',
+        },
+      };
+
+      return addNewArrayItemAndVerifyResult(yamlContent, 'plugins', 'foo', expectedResult);
+    });
+
     it('should survive with invalid yaml', () => {
       const yamlContent = 'service:';
       const expectedResult = { service: null, toplevel: ['foo'] };
@@ -320,6 +337,58 @@ describe('#yamlAstParser', () => {
         yamlContent,
         'toplevel.second',
         'bar',
+        expectedResult
+      );
+    });
+
+    it('preserves sibling properties after removing the last nested array item', () => {
+      const yamlContent = [
+        'plugins:',
+        '  modules:',
+        '    - foo',
+        '  localPath: ./.serverless_plugins',
+        'custom:',
+        '  taggedValue: keep-me',
+      ].join('\n');
+      const expectedResult = {
+        plugins: {
+          localPath: './.serverless_plugins',
+        },
+        custom: {
+          taggedValue: 'keep-me',
+        },
+      };
+
+      return removeExistingArrayItemAndVerifyResult(
+        yamlContent,
+        'plugins.modules',
+        'foo',
+        expectedResult
+      );
+    });
+
+    it('preserves quoted top level keys when removing the last nested array item', () => {
+      const yamlContent = [
+        '"plugins":',
+        '  modules:',
+        '    - foo',
+        '  localPath: ./.serverless_plugins',
+        'custom:',
+        '  taggedValue: keep-me',
+      ].join('\n');
+      const expectedResult = {
+        plugins: {
+          localPath: './.serverless_plugins',
+        },
+        custom: {
+          taggedValue: 'keep-me',
+        },
+      };
+
+      return removeExistingArrayItemAndVerifyResult(
+        yamlContent,
+        'plugins.modules',
+        'foo',
         expectedResult
       );
     });
