@@ -98,6 +98,16 @@ describe('checkForChanges', () => {
         expect(awsDeploy.serverless.service.provider.shouldNotDeploy).to.equal(false);
       });
     });
+
+    it('should skip subscription filter checks when deployment is not required', async () => {
+      checkIfDeploymentIsNecessaryStub.callsFake(async () => {
+        awsDeploy.serverless.service.provider.shouldNotDeploy = true;
+      });
+
+      await awsDeploy.checkForChanges();
+
+      expect(checkLogGroupSubscriptionFilterResourceLimitExceededStub).to.not.have.been.called;
+    });
   });
 
   describe('#getMostRecentObjects()', () => {
@@ -166,6 +176,76 @@ describe('checkForChanges', () => {
           { Key: `${s3Key}/151224711231-2016-08-18T15:43:00/artifact.zip` },
         ]);
       });
+    });
+
+    it('should select the newest deployment directory from unsorted keys', async () => {
+      const serviceObjects = {
+        Contents: [
+          { Key: `${s3Key}/141264711231-2016-08-18T15:42:00/cloudformation.json` },
+          { Key: `${s3Key}/151224711231-2016-08-18T15:43:00/artifact.zip` },
+          { Key: `${s3Key}/141264711231-2016-08-18T15:42:00/artifact.zip` },
+          { Key: `${s3Key}/151224711231-2016-08-18T15:43:00/cloudformation.json` },
+        ],
+      };
+
+      listObjectsV2Stub.resolves(serviceObjects);
+
+      const result = await awsDeploy.getMostRecentObjects();
+
+      expect(result).to.deep.equal([
+        { Key: `${s3Key}/151224711231-2016-08-18T15:43:00/cloudformation.json` },
+        { Key: `${s3Key}/151224711231-2016-08-18T15:43:00/artifact.zip` },
+      ]);
+    });
+
+    it('should ignore keys outside deployment timestamp directories', async () => {
+      listObjectsV2Stub.resolves({
+        Contents: [
+          { Key: `${s3Key}/not-a-deploy-dir/artifact.zip` },
+          { Key: `${s3Key}/151224711231-2016-08-18T15:43:00/cloudformation.json` },
+          { Key: `${s3Key}/151224711231-2016-08-18T15:43:00/artifact.zip` },
+        ],
+      });
+
+      const result = await awsDeploy.getMostRecentObjects();
+
+      expect(result).to.deep.equal([
+        { Key: `${s3Key}/151224711231-2016-08-18T15:43:00/cloudformation.json` },
+        { Key: `${s3Key}/151224711231-2016-08-18T15:43:00/artifact.zip` },
+      ]);
+    });
+  });
+
+  describe('#getFunctionsEarliestLastModifiedDate()', () => {
+    let requestStub;
+    let getAllFunctionsStub;
+    let getFunctionStub;
+
+    beforeEach(() => {
+      requestStub = sandbox.stub(awsDeploy.provider, 'request');
+      getAllFunctionsStub = sandbox.stub(awsDeploy.serverless.service, 'getAllFunctions');
+      getFunctionStub = sandbox.stub(awsDeploy.serverless.service, 'getFunction');
+    });
+
+    afterEach(() => {
+      awsDeploy.provider.request.restore();
+      awsDeploy.serverless.service.getAllFunctions.restore();
+      awsDeploy.serverless.service.getFunction.restore();
+    });
+
+    it('returns the earliest function last modified date', async () => {
+      getAllFunctionsStub.returns(['a', 'b']);
+      getFunctionStub.withArgs('a').returns({ name: 'func-a' });
+      getFunctionStub.withArgs('b').returns({ name: 'func-b' });
+      requestStub
+        .onFirstCall()
+        .resolves({ Configuration: { LastModified: '2021-05-20T15:34:16.494+0000' } })
+        .onSecondCall()
+        .resolves({ Configuration: { LastModified: '2021-05-19T15:34:16.494+0000' } });
+
+      const result = await awsDeploy.getFunctionsEarliestLastModifiedDate();
+
+      expect(result.toISOString()).to.equal(new Date('2021-05-19T15:34:16.494+0000').toISOString());
     });
   });
 
@@ -1141,6 +1221,75 @@ describe('test/unit/lib/plugins/aws/deploy/lib/checkForChanges.test.js', () => {
   });
 
   describe('checkLogGroupSubscriptionFilterResourceLimitExceeded', () => {
+    it('does not crash when cloudwatchLog event uses __proto__ as the log group name', async () => {
+      const deleteStub = sandbox.stub();
+      let serverless;
+      await runServerless({
+        fixture: 'check-for-changes',
+        command: 'deploy',
+        configExt: {
+          functions: {
+            fn1: {
+              events: [{ cloudwatchLog: '__proto__' }, { cloudwatchLog: '__proto__' }],
+            },
+          },
+        },
+        lastLifecycleHookName: 'aws:deploy:deploy:checkForChanges',
+        env: { AWS_CONTAINER_CREDENTIALS_FULL_URI: 'ignore' },
+        hooks: {
+          beforeInstanceInit: (serverlessInstance) => (serverless = serverlessInstance),
+        },
+        awsRequestStubMap: {
+          ...commonAwsSdkMock,
+          Lambda: {
+            getFunction: { Configuration: { LastModified: '2021-05-20T15:34:16.494+0000' } },
+          },
+          S3: {
+            listObjectsV2: async () => generateMatchingListObjectsResponse(serverless),
+            headObject: async (params) => generateMatchingHeadObjectResponse(serverless, params),
+            headBucket: {},
+          },
+          CloudWatchLogs: {
+            deleteSubscriptionFilter: deleteStub,
+            describeSubscriptionFilters: async () => ({ subscriptionFilters: [] }),
+          },
+        },
+      });
+      expect({}.polluted).to.equal(undefined);
+    });
+
+    it('does not crash when cloudwatchLog event uses constructor as the log group name', async () => {
+      const deleteStub = sandbox.stub();
+      let serverless;
+      await runServerless({
+        fixture: 'check-for-changes',
+        command: 'deploy',
+        configExt: {
+          functions: { fn1: { events: [{ cloudwatchLog: 'constructor' }] } },
+        },
+        lastLifecycleHookName: 'aws:deploy:deploy:checkForChanges',
+        env: { AWS_CONTAINER_CREDENTIALS_FULL_URI: 'ignore' },
+        hooks: {
+          beforeInstanceInit: (serverlessInstance) => (serverless = serverlessInstance),
+        },
+        awsRequestStubMap: {
+          ...commonAwsSdkMock,
+          Lambda: {
+            getFunction: { Configuration: { LastModified: '2021-05-20T15:34:16.494+0000' } },
+          },
+          S3: {
+            listObjectsV2: async () => generateMatchingListObjectsResponse(serverless),
+            headObject: async (params) => generateMatchingHeadObjectResponse(serverless, params),
+            headBucket: {},
+          },
+          CloudWatchLogs: {
+            deleteSubscriptionFilter: deleteStub,
+            describeSubscriptionFilters: async () => ({ subscriptionFilters: [] }),
+          },
+        },
+      });
+    });
+
     it('should not attempt to delete and add filter for same destination', async () => {
       const deleteStub = sandbox.stub();
       let serverless;
