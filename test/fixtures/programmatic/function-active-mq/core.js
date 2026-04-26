@@ -1,13 +1,12 @@
 'use strict';
 
 // NOTE: `stompit` is bundled into the deployment package
-// eslint-disable-next-line import/no-unresolved
+// eslint-disable-next-line import-x/no-unresolved
 const stompit = require('stompit');
 
 function consumer(event, context, callback) {
   const functionName = 'consumer';
   const messages = event.messages.map((message) => Buffer.from(message.data, 'base64').toString());
-  // eslint-disable-next-line no-console
   console.log(functionName, JSON.stringify(messages));
   return callback(null, event);
 }

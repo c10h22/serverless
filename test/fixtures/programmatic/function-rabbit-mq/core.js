@@ -1,7 +1,7 @@
 'use strict';
 
 // NOTE: `amqplib` is bundled into the deployment package
-// eslint-disable-next-line import/no-unresolved
+// eslint-disable-next-line import-x/no-unresolved
 const amqp = require('amqplib');
 
 function consumer(event, context, callback) {
@@ -14,7 +14,6 @@ function consumer(event, context, callback) {
       messages.push(Buffer.from(message.data, 'base64').toString());
     });
   });
-  // eslint-disable-next-line no-console
   console.log(functionName, JSON.stringify(messages));
 
   return callback(null, event);

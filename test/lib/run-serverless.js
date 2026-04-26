@@ -81,7 +81,8 @@ module.exports = async (
   } catch (error) {
     throw new TypeError(
       `Provided 'serverlessPath' (${serverlessPath}) ` +
-        `doesn't point a working node module: ${error.message}`
+        `doesn't point a working node module: ${error.message}`,
+      { cause: error }
     );
   }
   cwd = ensureString(cwd, {
@@ -149,10 +150,9 @@ module.exports = async (
   }
   const confirmedCwd = await resolveCwd({ cwd, config });
 
-  const resolveConfigurationPath = require(path.resolve(
-    serverlessPath,
-    'lib/cli/resolve-configuration-path'
-  ));
+  const resolveConfigurationPath = require(
+    path.resolve(serverlessPath, 'lib/cli/resolve-configuration-path')
+  );
   const readConfiguration = require(path.resolve(serverlessPath, 'lib/configuration/read'));
   const resolveVariables = require(path.resolve(serverlessPath, 'lib/configuration/variables'));
 
