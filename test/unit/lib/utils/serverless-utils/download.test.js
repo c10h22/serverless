@@ -14,12 +14,30 @@ describe('serverless-utils/download', () => {
   let server;
   let baseUrl;
   let zipBuffer;
+  let nestedZipBuffer;
+  let traversalZipBuffer;
+  let traversalFileName;
   let tmpDir;
 
   before(async () => {
     const zip = new AdmZip();
     zip.addFile('file.txt', Buffer.from('fixture'));
     zipBuffer = zip.toBuffer();
+
+    const nestedZip = new AdmZip();
+    nestedZip.addFile('template-main/serverless.yml', Buffer.from('service: fixture\n'));
+    nestedZipBuffer = nestedZip.toBuffer();
+
+    traversalFileName = `serverless-download-${Date.now()}-evil.txt`;
+    const traversalZip = new AdmZip();
+    traversalZip.addFile(`xx/${traversalFileName}`, Buffer.from('evil'));
+    traversalZipBuffer = traversalZip.toBuffer();
+    traversalZipBuffer = Buffer.from(
+      traversalZipBuffer
+        .toString('binary')
+        .replaceAll(`xx/${traversalFileName}`, `../${traversalFileName}`),
+      'binary'
+    );
 
     server = http.createServer((req, res) => {
       if (req.url === '/layer-download?Signature=opaque') {
@@ -42,9 +60,35 @@ describe('serverless-utils/download', () => {
         return;
       }
 
+      if (req.url === '/html-fallback') {
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        res.end(Buffer.from('<!doctype html>\n'));
+        return;
+      }
+
+      if (req.url === '/binary-fallback') {
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'application/octet-stream');
+        res.end(Buffer.from('binary payload'));
+        return;
+      }
+
       if (req.url === '/unknown-payload') {
         res.statusCode = 200;
         res.end(Buffer.from('plain text payload'));
+        return;
+      }
+
+      if (req.url === '/nested-zip') {
+        res.statusCode = 200;
+        res.end(nestedZipBuffer);
+        return;
+      }
+
+      if (req.url === '/traversal-zip') {
+        res.statusCode = 200;
+        res.end(traversalZipBuffer);
         return;
       }
 
@@ -102,6 +146,23 @@ describe('serverless-utils/download', () => {
     expect(await fsp.readFile(filePath, 'utf8')).to.equal('a,b\n1,2\n');
   });
 
+  it('uses a broad MIME lookup for content-type extension fallback', async () => {
+    await download(`${baseUrl}/html-fallback`, tmpDir);
+
+    expect(await fsp.readFile(path.join(tmpDir, 'html-fallback.html'), 'utf8')).to.equal(
+      '<!doctype html>\n'
+    );
+  });
+
+  it('preserves the bare basename for generic binary content types', async () => {
+    await download(`${baseUrl}/binary-fallback`, tmpDir);
+
+    expect(await fsp.readFile(path.join(tmpDir, 'binary-fallback'), 'utf8')).to.equal(
+      'binary payload'
+    );
+    expect(await fse.pathExists(path.join(tmpDir, 'binary-fallback.bin'))).to.equal(false);
+  });
+
   it('preserves the bare basename when no extension can be inferred', async () => {
     await download(`${baseUrl}/unknown-payload`, tmpDir);
 
@@ -115,6 +176,30 @@ describe('serverless-utils/download', () => {
     await download(`${baseUrl}/layer-download?Signature=opaque`, tmpDir, { extract: true });
 
     expect(await fsp.readFile(path.join(tmpDir, 'file.txt'), 'utf8')).to.equal('fixture');
+  });
+
+  it('rejects non-ZIP payloads when extract is enabled', async () => {
+    await expect(download(`${baseUrl}/unknown-payload`, tmpDir, { extract: true })).to.be.rejected;
+
+    expect(await fse.pathExists(path.join(tmpDir, 'unknown-payload'))).to.equal(false);
+  });
+
+  it('extracts a zip archive with the requested strip depth', async () => {
+    await download(`${baseUrl}/nested-zip`, tmpDir, { extract: true, strip: 1 });
+
+    expect(await fsp.readFile(path.join(tmpDir, 'serverless.yml'), 'utf8')).to.equal(
+      'service: fixture\n'
+    );
+    expect(await fse.pathExists(path.join(tmpDir, 'template-main'))).to.equal(false);
+  });
+
+  it('does not write zip entries outside the destination', async () => {
+    await expect(download(`${baseUrl}/traversal-zip`, tmpDir, { extract: true })).to.be.rejected;
+
+    expect(await fse.pathExists(path.join(tmpDir, 'xx', traversalFileName))).to.equal(false);
+    expect(await fse.pathExists(path.join(path.dirname(tmpDir), traversalFileName))).to.equal(
+      false
+    );
   });
 
   it('preserves authorization across approved redirect hostnames', async () => {

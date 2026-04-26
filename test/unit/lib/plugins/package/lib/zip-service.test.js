@@ -4,10 +4,10 @@ const os = require('os');
 const path = require('path');
 const JsZip = require('jszip');
 const glob = require('../../../../../../lib/utils/glob');
-const BbPromise = require('bluebird');
-const fs = BbPromise.promisifyAll(require('fs'));
-const childProcess = BbPromise.promisifyAll(require('child_process'));
+const fs = require('fs');
+const childProcess = require('child_process');
 const sinon = require('sinon');
+const proxyquire = require('proxyquire');
 const isObject = require('type/object/is');
 const Package = require('../../../../../../lib/plugins/package/package');
 const Serverless = require('../../../../../../lib/serverless');
@@ -15,6 +15,9 @@ const { getTmpDirPath } = require('../../../../../utils/fs');
 
 // Configure chai
 const { expect } = require('chai');
+
+const resolveExecCall = (stub) => stub.callsArgWith(2, null, '', '');
+const rejectExecCall = (stub) => stub.callsArgWith(2, new Error('npm ls failed'));
 
 describe('zipService', () => {
   let tmpDirPath;
@@ -126,14 +129,27 @@ describe('zipService', () => {
       beforeEach(() => {
         serviceDir = packagePlugin.serverless.serviceDir;
         globSyncStub = sinon.stub(glob, 'sync');
-        execAsyncStub = sinon.stub(childProcess, 'execAsync');
-        readFileAsyncStub = sinon.stub(fs, 'readFileAsync');
+        execAsyncStub = sinon.stub(childProcess, 'exec');
+        readFileAsyncStub = sinon.stub(fs.promises, 'readFile');
       });
 
       afterEach(() => {
         glob.sync.restore();
-        childProcess.execAsync.restore();
-        fs.readFileAsync.restore();
+        childProcess.exec.restore();
+        fs.promises.readFile.restore();
+      });
+
+      it('does not add async helpers to core modules when loaded', () => {
+        const fakeChildProcess = { exec: () => {} };
+        const fakeFs = { promises: { readFile: () => {} } };
+
+        proxyquire.noCallThru().load('../../../../../../lib/plugins/package/lib/zip-service', {
+          child_process: fakeChildProcess,
+          fs: fakeFs,
+        });
+
+        expect(fakeChildProcess).to.not.have.property('execAsync');
+        expect(fakeFs).to.not.have.property('readFileAsync');
       });
 
       it('should do nothing if no packages are used', async () => {
@@ -164,7 +180,7 @@ describe('zipService', () => {
         const filePaths = ['package.json', 'node_modules'];
 
         globSyncStub.returns(filePaths);
-        execAsyncStub.resolves();
+        resolveExecCall(execAsyncStub);
         const depPaths = '';
         readFileAsyncStub.resolves(depPaths);
 
@@ -214,8 +230,8 @@ describe('zipService', () => {
         const filePaths = ['package.json', 'node_modules'];
 
         globSyncStub.returns(filePaths);
-        execAsyncStub.onCall(0).resolves();
-        execAsyncStub.onCall(1).rejects();
+        resolveExecCall(execAsyncStub.onCall(0));
+        rejectExecCall(execAsyncStub.onCall(1));
         readFileAsyncStub.resolves();
 
         return expect(packagePlugin.excludeDevDependencies(params)).to.be.fulfilled.then(
@@ -234,7 +250,7 @@ describe('zipService', () => {
         const filePaths = ['package.json', 'node_modules'];
 
         globSyncStub.returns(filePaths);
-        execAsyncStub.resolves();
+        resolveExecCall(execAsyncStub);
 
         readFileAsyncStub.onCall(0).resolves();
         readFileAsyncStub.onCall(1).rejects();
@@ -266,12 +282,12 @@ describe('zipService', () => {
         ];
 
         globSyncStub.returns(filePaths);
-        execAsyncStub.onCall(0).resolves();
-        execAsyncStub.onCall(1).resolves();
-        execAsyncStub.onCall(2).rejects();
-        execAsyncStub.onCall(3).rejects();
-        execAsyncStub.onCall(4).resolves();
-        execAsyncStub.onCall(5).resolves();
+        resolveExecCall(execAsyncStub.onCall(0));
+        resolveExecCall(execAsyncStub.onCall(1));
+        rejectExecCall(execAsyncStub.onCall(2));
+        rejectExecCall(execAsyncStub.onCall(3));
+        resolveExecCall(execAsyncStub.onCall(4));
+        resolveExecCall(execAsyncStub.onCall(5));
         const depPaths = [
           path.join(serviceDir, 'node_modules', 'module-1'),
           path.join(serviceDir, 'node_modules', 'module-2'),
@@ -350,7 +366,7 @@ describe('zipService', () => {
         const filePaths = ['package.json', 'node_modules'];
 
         globSyncStub.returns(filePaths);
-        execAsyncStub.resolves();
+        resolveExecCall(execAsyncStub);
         const depPaths = [
           path.join(serviceDir, 'node_modules', 'module-1'),
           path.join(serviceDir, 'node_modules', 'module-2'),
@@ -411,7 +427,7 @@ describe('zipService', () => {
         ];
 
         globSyncStub.returns(filePaths);
-        execAsyncStub.resolves();
+        resolveExecCall(execAsyncStub);
         const depPaths = [
           path.join(serviceDir, 'node_modules', 'module-1'),
           path.join(serviceDir, 'node_modules', 'module-2'),
@@ -484,7 +500,7 @@ describe('zipService', () => {
         const filePaths = ['package.json', 'node_modules'];
 
         globSyncStub.returns(filePaths);
-        execAsyncStub.resolves();
+        resolveExecCall(execAsyncStub);
 
         const devDepPaths = [
           path.join(serviceDir, 'node_modules', 'module-1'),
@@ -542,7 +558,7 @@ describe('zipService', () => {
         const filePaths = ['node_modules/', 'package.json'].concat(devPaths).concat(prodPaths);
 
         globSyncStub.returns(filePaths);
-        execAsyncStub.resolves();
+        resolveExecCall(execAsyncStub);
 
         const mapper = (depPath) => path.join(`${serviceDir}`, depPath);
 
@@ -604,7 +620,7 @@ describe('zipService', () => {
         ];
 
         globSyncStub.returns(filePaths);
-        execAsyncStub.resolves();
+        resolveExecCall(execAsyncStub);
         const deps = [
           'node_modules/module-1',
           'node_modules/module-2',
