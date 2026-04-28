@@ -371,6 +371,147 @@ describe('AwsProvider', () => {
     });
   });
 
+  describe('#getAwsSdkV3Config()', () => {
+    it('returns SDK v3 config with explicit region and env credentials', async () => {
+      process.env.AWS_ACCESS_KEY_ID = 'accessKeyId';
+      process.env.AWS_SECRET_ACCESS_KEY = 'secretAccessKey';
+      process.env.AWS_SESSION_TOKEN = 'sessionToken';
+
+      const config = await awsProvider.getAwsSdkV3Config({ region: 'eu-west-1' });
+
+      expect(config.region).to.equal('eu-west-1');
+      expect(config.credentials).to.be.a('function');
+      await expect(config.credentials()).to.eventually.deep.equal({
+        accessKeyId: 'accessKeyId',
+        secretAccessKey: 'secretAccessKey',
+        sessionToken: 'sessionToken',
+      });
+    });
+
+    it('prefers stage-specific env credentials over standard env credentials', async () => {
+      process.env.AWS_ACCESS_KEY_ID = 'accessKeyId';
+      process.env.AWS_SECRET_ACCESS_KEY = 'secretAccessKey';
+      process.env.AWS_DEV_ACCESS_KEY_ID = 'stageAccessKeyId';
+      process.env.AWS_DEV_SECRET_ACCESS_KEY = 'stageSecretAccessKey';
+
+      const config = await awsProvider.getAwsSdkV3Config();
+
+      await expect(config.credentials()).to.eventually.deep.equal({
+        accessKeyId: 'stageAccessKeyId',
+        secretAccessKey: 'stageSecretAccessKey',
+        sessionToken: undefined,
+      });
+    });
+
+    it('includes SDK v3 request handler configuration', async () => {
+      process.env.AWS_CLIENT_TIMEOUT = '1234';
+
+      const config = await awsProvider.getAwsSdkV3Config();
+
+      expect(config.requestHandler).to.exist;
+    });
+
+    it('falls back to provider region only when SDK v3 region is undefined', async () => {
+      expect((await awsProvider.getAwsSdkV3Config({ region: undefined })).region).to.equal(
+        'us-east-1'
+      );
+      expect((await awsProvider.getAwsSdkV3Config({ region: '' })).region).to.equal('');
+      expect((await awsProvider.getAwsSdkV3Config({ region: null })).region).to.equal(null);
+    });
+
+    it('passes profile and custom options to the config helpers', async () => {
+      const buildClientConfigStub = sinon.stub().returns({ config: true });
+      const getAwsSdkV3CredentialsProviderStub = sinon.stub().returns('credentials');
+      const getAwsSdkV3CredentialsProviderCacheKeyStub = sinon.stub().returns('cache-key');
+      const AwsProviderProxyquired = proxyquire
+        .noCallThru()
+        .load('../../../../../lib/plugins/aws/provider.js', {
+          '../../aws/config': { buildClientConfig: buildClientConfigStub },
+          '../../aws/credentials': {
+            getAwsSdkV3CredentialsProviderCacheKey: getAwsSdkV3CredentialsProviderCacheKeyStub,
+            getAwsSdkV3CredentialsProvider: getAwsSdkV3CredentialsProviderStub,
+          },
+        });
+      const provider = new AwsProviderProxyquired(serverless, options);
+
+      const config = await provider.getAwsSdkV3Config({
+        profile: 'custom-profile',
+        maxAttempts: 2,
+        retryMode: 'adaptive',
+      });
+
+      expect(config).to.deep.equal({ config: true });
+      expect(getAwsSdkV3CredentialsProviderStub).to.have.been.calledOnceWithExactly({
+        provider,
+        profile: 'custom-profile',
+      });
+      expect(buildClientConfigStub).to.have.been.calledOnceWithExactly({
+        maxAttempts: 2,
+        retryMode: 'adaptive',
+        region: 'us-east-1',
+        credentials: 'credentials',
+      });
+    });
+
+    it('reuses SDK v3 credential providers for the same credential source', async () => {
+      const firstConfig = await awsProvider.getAwsSdkV3Config();
+      const secondConfig = await awsProvider.getAwsSdkV3Config();
+
+      expect(firstConfig.credentials).to.equal(secondConfig.credentials);
+    });
+
+    it('uses different SDK v3 credential providers for different explicit profiles', async () => {
+      const firstConfig = await awsProvider.getAwsSdkV3Config({ profile: 'first' });
+      const secondConfig = await awsProvider.getAwsSdkV3Config({ profile: 'second' });
+
+      expect(firstConfig.credentials).to.not.equal(secondConfig.credentials);
+    });
+
+    it('passes SDK v3 client options through without leaking Serverless metadata options', async () => {
+      const requestHandler = {};
+
+      const config = await awsProvider.getAwsSdkV3Config({
+        service: 'S3',
+        profile: 'custom-profile',
+        endpoint: 'http://localhost:4566',
+        forcePathStyle: true,
+        requestHandler,
+      });
+
+      expect(config).to.include({
+        endpoint: 'http://localhost:4566',
+        forcePathStyle: true,
+        requestHandler,
+      });
+      expect(config).to.not.have.property('service');
+      expect(config).to.not.have.property('profile');
+    });
+
+    it('does not implicitly enable S3 acceleration for SDK v3 S3 configs', async () => {
+      awsProvider.options['aws-s3-accelerate'] = true;
+
+      const config = await awsProvider.getAwsSdkV3Config({ service: 'S3' });
+
+      expect(config).to.not.have.property('useAccelerateEndpoint');
+    });
+
+    it('preserves explicit SDK v3 S3 acceleration options', async () => {
+      awsProvider.options['aws-s3-accelerate'] = true;
+
+      const enabledConfig = await awsProvider.getAwsSdkV3Config({
+        service: 'S3',
+        useAccelerateEndpoint: true,
+      });
+      const disabledConfig = await awsProvider.getAwsSdkV3Config({
+        service: 'S3',
+        useAccelerateEndpoint: false,
+      });
+
+      expect(enabledConfig.useAccelerateEndpoint).to.equal(true);
+      expect(disabledConfig.useAccelerateEndpoint).to.equal(false);
+    });
+  });
+
   describe('#getServerlessDeploymentBucketName()', () => {
     it('should return the name of the serverless deployment bucket', async () => {
       const describeStackResourcesStub = sinon.stub(awsProvider, 'request').resolves({

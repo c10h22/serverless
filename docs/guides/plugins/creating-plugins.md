@@ -11,7 +11,7 @@ Creating a custom plugin lets you:
 
 ## Creating a plugin
 
-The simplest way to create a Serverless Framework plugin is to write a JavaScript file:
+The simplest way to create a Serverless plugin is to write a JavaScript file:
 
 ```javascript
 'use strict';
@@ -50,13 +50,13 @@ To correctly configure the plugin's NPM package, set the `main` property to poin
 }
 ```
 
-It is also a good practice to add `serverless` to the `peerDependencies` section. That ensures that your plugin runs only with the Serverless Framework versions it supports.
+It is also a good practice to add `osls` to the `peerDependencies` section. That ensures that your plugin runs only with the Serverless versions it supports.
 
 ```json
 {
   ...
   "peerDependencies": {
-    "serverless": "^2.60 || 3"
+    "osls": "^3.67"
   }
 }
 ```
@@ -192,6 +192,82 @@ class MyPlugin {
 ```
 
 The plugin will now only be executed when the service's provider matches the given provider.
+
+## AWS SDK v3 clients
+
+AWS plugins should use AWS SDK v3 clients directly instead of using `provider.request()`
+as a generic AWS API proxy.
+
+Plugins should own the AWS SDK v3 clients they use. Do not rely on AWS SDK
+packages that happen to be installed by Serverless.
+
+If your published plugin imports AWS SDK v3 clients at runtime, declare them in
+`dependencies`:
+
+```json
+{
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.975.0"
+  }
+}
+```
+
+If your plugin publishes a self-contained bundle that includes AWS SDK v3 client
+code, declare those clients in `devDependencies` instead and make sure your
+bundler does not externalize them:
+
+```json
+{
+  "devDependencies": {
+    "@aws-sdk/client-s3": "^3.975.0"
+  }
+}
+```
+
+Use `provider.getAwsSdkV3Config()` to get Serverless-resolved AWS configuration for
+those clients:
+
+```javascript
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+
+class MyPlugin {
+  constructor(serverless) {
+    this.provider = serverless.getProvider('aws');
+  }
+
+  async upload() {
+    const config = await this.provider.getAwsSdkV3Config();
+    const s3 = new S3Client(config);
+
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: 'bucket',
+        Key: 'key',
+        Body: 'body',
+      })
+    );
+  }
+}
+```
+
+`provider.getAwsSdkV3Config(options)` returns AWS SDK v3 client configuration,
+including Serverless-resolved region, credentials, retry settings, and proxy,
+custom CA, or timeout configuration.
+
+The returned `credentials` value is an AWS SDK v3 credential provider function.
+
+Supported Serverless-specific options are:
+
+- `region`: override the resolved provider region for this client
+- `profile`: resolve credentials from a specific AWS profile
+
+Other AWS SDK v3 client options, such as `endpoint`, `logger`, `requestHandler`,
+`forcePathStyle`, or `useAccelerateEndpoint`, are passed through to the returned config.
+
+`provider.request()` and `provider.sdk` are legacy AWS SDK v2 surfaces. They are
+not the recommended AWS SDK v3 plugin API. Core framework internals that have
+not migrated still use that legacy path, so this section describes the
+plugin-created SDK v3 client path only.
 
 ## ESM plugins
 

@@ -1,14 +1,14 @@
 # Plugins
 
-A plugin is custom JavaScript code that extends the Serverless Framework with new features.
+A plugin is custom JavaScript code that extends Serverless with new features.
 
-If you or your organization have a specific workflow, install a pre-written plugin or write one to customize the Framework to your needs.
+If you or your organization have a specific workflow, install a pre-written plugin or write one to customize Serverless to your needs.
 
-Since the Serverless Framework is a group of "core" plugins, custom plugins are written exactly the same way as core plugins. Learn more about [creating a custom plugin](creating-plugins.md).
+Since Serverless is a group of "core" plugins, custom plugins are written exactly the same way as core plugins. Learn more about [creating a custom plugin](creating-plugins.md).
 
-> **Security note:** Plugins are JavaScript code that Serverless Framework loads and executes. Treat configured plugins, local plugin paths, and `plugins.localPath` as trusted code. Do not run Serverless commands against untrusted projects, templates, or pull requests that configure plugins.
+> **Security note:** Plugins are JavaScript code that Serverless loads and executes. Treat configured plugins, local plugin paths, and `plugins.localPath` as trusted code. Do not run Serverless commands against untrusted projects, templates, or pull requests that configure plugins.
 
-Explore existing plugins in the [Serverless Framework Plugins repository](https://www.serverless.com/plugins).
+Install only plugins from sources you trust.
 
 ## Installing plugins
 
@@ -48,6 +48,10 @@ custom:
 ```
 
 Note for plugin authors: read [Extending the configuration](custom-configuration.md) to learn how to enhance `serverless.yml` with configuration validation.
+
+AWS plugin authors should use AWS SDK v3 clients directly and obtain
+Serverless-resolved client configuration with `provider.getAwsSdkV3Config()`.
+See [AWS SDK v3 clients](creating-plugins.md#aws-sdk-v3-clients) for details.
 
 Only helpers documented in the plugin guides are considered supported for
 plugin authors. Avoid importing files from the framework's internal `lib/**`
