@@ -28,6 +28,11 @@ describe('test/unit/scripts/serverless-signals.test.js', () => {
   let timerToken;
   let stubs;
   let originalPlatformDescriptor;
+  let originalStackTraceLimit;
+
+  beforeEach(() => {
+    originalStackTraceLimit = Error.stackTraceLimit;
+  });
 
   const loadScript = ({ signals = ['SIGINT', 'SIGTERM'], listenerCount = 0 } = {}) => {
     sleepDeferred = deferred();
@@ -77,7 +82,6 @@ describe('test/unit/scripts/serverless-signals.test.js', () => {
     delete require.cache[require.resolve(modulePath)];
 
     proxyquire.noCallThru().load(modulePath, {
-      'essentials': {},
       'graceful-fs': { gracefulify: sinon.stub() },
       '../lib/utils/serverless-utils/log-reporters/node': {},
       '../lib/utils/serverless-utils/log': { log, progress },
@@ -104,6 +108,8 @@ describe('test/unit/scripts/serverless-signals.test.js', () => {
       Object.defineProperty(process, 'platform', originalPlatformDescriptor);
       originalPlatformDescriptor = null;
     }
+
+    Error.stackTraceLimit = originalStackTraceLimit;
 
     sinon.restore();
   });
