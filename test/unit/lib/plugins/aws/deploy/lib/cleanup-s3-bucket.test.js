@@ -49,51 +49,29 @@ describe('cleanupS3Bucket', () => {
       });
     });
 
-    it('should return all to be removed service objects (except the last 4)', async () => {
+    it('should return all service objects except the default preserved deployments', async () => {
+      const deploymentDirectories = [
+        '1000000000000-2001-09-09T01:46:40.000Z',
+        '1000000001000-2001-09-09T01:46:41.000Z',
+        '1000000002000-2001-09-09T01:46:42.000Z',
+        '1000000003000-2001-09-09T01:46:43.000Z',
+        '1000000004000-2001-09-09T01:46:44.000Z',
+        '1000000005000-2001-09-09T01:46:45.000Z',
+      ];
       const serviceObjects = {
-        Contents: [
-          { Key: `${s3Key}/151224711231-2016-08-18T15:42:00/artifact.zip` },
-          { Key: `${s3Key}/151224711231-2016-08-18T15:42:00/cloudformation.json` },
-          { Key: `${s3Key}/141264711231-2016-08-18T15:43:00/artifact.zip` },
-          { Key: `${s3Key}/141264711231-2016-08-18T15:43:00/cloudformation.json` },
-          { Key: `${s3Key}/141321321541-2016-08-18T11:23:02/artifact.zip` },
-          { Key: `${s3Key}/141321321541-2016-08-18T11:23:02/cloudformation.json` },
-          { Key: `${s3Key}/142003031341-2016-08-18T12:46:04/artifact.zip` },
-          { Key: `${s3Key}/142003031341-2016-08-18T12:46:04/cloudformation.json` },
-          { Key: `${s3Key}/113304333331-2016-08-18T13:40:06/artifact.zip` },
-          { Key: `${s3Key}/113304333331-2016-08-18T13:40:06/cloudformation.json` },
-          { Key: `${s3Key}/903940390431-2016-08-18T23:42:08/artifact.zip` },
-          { Key: `${s3Key}/903940390431-2016-08-18T23:42:08/cloudformation.json` },
-        ],
+        Contents: deploymentDirectories.flatMap((directory) => [
+          { Key: `${s3Key}/${directory}/artifact.zip` },
+          { Key: `${s3Key}/${directory}/cloudformation.json` },
+        ]),
       };
 
       const listObjectsStub = sinon.stub(awsDeploy.provider, 'request').resolves(serviceObjects);
 
       return awsDeploy.getObjectsToRemove().then((objectsToRemove) => {
-        expect(objectsToRemove).to.not.include({
-          Key: `${s3Key}${s3Key}/141321321541-2016-08-18T11:23:02/artifact.zip`,
-        });
-        expect(objectsToRemove).to.not.include({
-          Key: `${s3Key}${s3Key}/141321321541-2016-08-18T11:23:02/cloudformation.json`,
-        });
-        expect(objectsToRemove).to.not.include({
-          Key: `${s3Key}${s3Key}/142003031341-2016-08-18T12:46:04/artifact.zip`,
-        });
-        expect(objectsToRemove).to.not.include({
-          Key: `${s3Key}${s3Key}/142003031341-2016-08-18T12:46:04/cloudformation.json`,
-        });
-        expect(objectsToRemove).to.not.include({
-          Key: `${s3Key}${s3Key}/151224711231-2016-08-18T15:42:00/artifact.zip`,
-        });
-        expect(objectsToRemove).to.not.include({
-          Key: `${s3Key}${s3Key}/151224711231-2016-08-18T15:42:00/cloudformation.json`,
-        });
-        expect(objectsToRemove).to.not.include({
-          Key: `${s3Key}${s3Key}/903940390431-2016-08-18T23:42:08/artifact.zip`,
-        });
-        expect(objectsToRemove).to.not.include({
-          Key: `${s3Key}${s3Key}/903940390431-2016-08-18T23:42:08/cloudformation.json`,
-        });
+        expect(objectsToRemove).to.deep.equal([
+          { Key: `${s3Key}/${deploymentDirectories[0]}/artifact.zip` },
+          { Key: `${s3Key}/${deploymentDirectories[0]}/cloudformation.json` },
+        ]);
         expect(listObjectsStub.calledOnce).to.be.equal(true);
         expect(listObjectsStub).to.have.been.calledWithExactly('S3', 'listObjectsV2', {
           Bucket: awsDeploy.bucketName,
@@ -396,6 +374,23 @@ describe('cleanupS3Bucket', () => {
       try {
         await awsDeploy.cleanupArtifactsForEmptyChangeSet();
 
+        expect(requestStub.firstCall.args).to.deep.equal([
+          'S3',
+          'listObjectsV2',
+          {
+            Bucket: awsDeploy.bucketName,
+            Prefix: `${s3Key}/${deploymentDirectory}/`,
+          },
+        ]);
+        expect(requestStub.secondCall.args).to.deep.equal([
+          'S3',
+          'listObjectsV2',
+          {
+            Bucket: awsDeploy.bucketName,
+            Prefix: `${s3Key}/${deploymentDirectory}/`,
+            ContinuationToken: 'next-page',
+          },
+        ]);
         const deleteCall = requestStub
           .getCalls()
           .find((call) => call.args[0] === 'S3' && call.args[1] === 'deleteObjects');
@@ -405,6 +400,96 @@ describe('cleanupS3Bucket', () => {
             Objects: [{ Key: firstKey }, { Key: secondKey }],
           },
         });
+      } finally {
+        awsDeploy.provider.request.restore();
+      }
+    });
+
+    it('should list only the selected deployment directory', async () => {
+      const deploymentDirectory = '151224711231-2016-08-18T15:42:00';
+      const artifactDirectoryName = `${s3Key}/${deploymentDirectory}`;
+      const artifactKey = `${artifactDirectoryName}/artifact.zip`;
+      const requestStub = sinon.stub(awsDeploy.provider, 'request');
+      awsDeploy.serverless.service.package.artifactDirectoryName = artifactDirectoryName;
+      requestStub.withArgs('S3', 'listObjectsV2').resolves({
+        Contents: [{ Key: artifactKey }],
+      });
+      requestStub.withArgs('S3', 'deleteObjects').resolves();
+
+      try {
+        await awsDeploy.cleanupArtifactsForEmptyChangeSet();
+
+        expect(requestStub.firstCall.args).to.deep.equal([
+          'S3',
+          'listObjectsV2',
+          {
+            Bucket: awsDeploy.bucketName,
+            Prefix: `${artifactDirectoryName}/`,
+          },
+        ]);
+      } finally {
+        awsDeploy.provider.request.restore();
+      }
+    });
+
+    for (const { description, resolveArtifactDirectoryName } of [
+      {
+        description: 'the artifact directory is the stage deployment root',
+        resolveArtifactDirectoryName: () => s3Key,
+      },
+      {
+        description: 'the artifact directory is the stage deployment root with a trailing slash',
+        resolveArtifactDirectoryName: () => `${s3Key}/`,
+      },
+      {
+        description: 'the artifact directory is not a deployment directory',
+        resolveArtifactDirectoryName: () => `${s3Key}/not-a-deployment-directory`,
+      },
+      {
+        description: 'the artifact directory is nested below a deployment directory',
+        resolveArtifactDirectoryName: () => `${s3Key}/151224711231-2016-08-18T15:42:00/nested`,
+      },
+    ]) {
+      it(`should reject when ${description}`, async () => {
+        const requestStub = sinon.stub(awsDeploy.provider, 'request');
+        awsDeploy.serverless.service.package.artifactDirectoryName = resolveArtifactDirectoryName();
+
+        try {
+          await expect(
+            awsDeploy.cleanupArtifactsForEmptyChangeSet()
+          ).to.be.eventually.rejected.and.have.property(
+            'code',
+            'INVALID_EMPTY_CHANGE_SET_ARTIFACT_DIRECTORY'
+          );
+          expect(requestStub).to.not.have.been.called;
+        } finally {
+          awsDeploy.provider.request.restore();
+        }
+      });
+    }
+
+    it('should normalize trailing slashes for a selected deployment directory', async () => {
+      const deploymentDirectory = '151224711231-2016-08-18T15:42:00';
+      const artifactDirectoryName = `${s3Key}/${deploymentDirectory}`;
+      const artifactKey = `${artifactDirectoryName}/artifact.zip`;
+      const requestStub = sinon.stub(awsDeploy.provider, 'request');
+      awsDeploy.serverless.service.package.artifactDirectoryName = `${artifactDirectoryName}/`;
+      requestStub.withArgs('S3', 'listObjectsV2').resolves({
+        Contents: [{ Key: artifactKey }],
+      });
+      requestStub.withArgs('S3', 'deleteObjects').resolves();
+
+      try {
+        await awsDeploy.cleanupArtifactsForEmptyChangeSet();
+
+        expect(requestStub.firstCall.args).to.deep.equal([
+          'S3',
+          'listObjectsV2',
+          {
+            Bucket: awsDeploy.bucketName,
+            Prefix: `${artifactDirectoryName}/`,
+          },
+        ]);
       } finally {
         awsDeploy.provider.request.restore();
       }
