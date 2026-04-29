@@ -135,6 +135,86 @@ describe('test/unit/lib/plugins/aws/remove/index.test.js', () => {
     });
   });
 
+  it('deletes each page of S3 objects as it is listed', async () => {
+    const listObjectsV2Stub = sinon
+      .stub()
+      .onFirstCall()
+      .returns({
+        Contents: [{ Key: 'first' }],
+        NextContinuationToken: 'next-page',
+      })
+      .onSecondCall()
+      .returns({ Contents: [{ Key: 'second' }] });
+    const innerDeleteObjectsStub = sinon.stub().resolves();
+
+    const { serverless } = await runServerless({
+      fixture: 'function',
+      command: 'remove',
+      awsRequestStubMap: {
+        ...awsRequestStubMap,
+        S3: {
+          deleteObjects: innerDeleteObjectsStub,
+          listObjectsV2: listObjectsV2Stub,
+          headBucket: {},
+        },
+      },
+    });
+
+    expect(listObjectsV2Stub).to.have.been.calledTwice;
+    expect(listObjectsV2Stub.firstCall.args[0]).to.include({
+      Bucket: 'resource-id',
+      Prefix: `serverless/${serverless.service.service}/dev/`,
+    });
+    expect(listObjectsV2Stub.secondCall.args[0]).to.include({
+      Bucket: 'resource-id',
+      Prefix: `serverless/${serverless.service.service}/dev/`,
+      ContinuationToken: 'next-page',
+    });
+    expect(innerDeleteObjectsStub).to.have.been.calledTwice;
+    expect(innerDeleteObjectsStub.firstCall.args[0]).to.deep.equal({
+      Bucket: 'resource-id',
+      Delete: {
+        Objects: [{ Key: 'first' }],
+      },
+    });
+    expect(innerDeleteObjectsStub.secondCall.args[0]).to.deep.equal({
+      Bucket: 'resource-id',
+      Delete: {
+        Objects: [{ Key: 'second' }],
+      },
+    });
+    expect(innerDeleteObjectsStub.firstCall.calledAfter(listObjectsV2Stub.firstCall)).to.be.true;
+    expect(listObjectsV2Stub.secondCall.calledAfter(innerDeleteObjectsStub.firstCall)).to.be.true;
+    expect(innerDeleteObjectsStub.secondCall.calledAfter(listObjectsV2Stub.secondCall)).to.be.true;
+  });
+
+  it('deletes S3 bucket objects in batches of 1000', async () => {
+    const objects = Array.from({ length: 1001 }, (ignored, index) => ({ Key: `object-${index}` }));
+    const innerDeleteObjectsStub = sinon.stub().resolves();
+
+    await runServerless({
+      fixture: 'function',
+      command: 'remove',
+      awsRequestStubMap: {
+        ...awsRequestStubMap,
+        S3: {
+          deleteObjects: innerDeleteObjectsStub,
+          listObjectsV2: { Contents: objects },
+          headBucket: {},
+        },
+      },
+    });
+
+    expect(innerDeleteObjectsStub).to.have.been.calledTwice;
+    expect(innerDeleteObjectsStub.firstCall.args[0].Delete.Objects).to.have.lengthOf(1000);
+    expect(innerDeleteObjectsStub.secondCall.args[0]).to.deep.equal({
+      Bucket: 'resource-id',
+      Delete: {
+        Objects: objects.slice(1000),
+      },
+    });
+  });
+
   it('skips attempts to remove S3 objects if S3 bucket not found', async () => {
     const { awsNaming } = await runServerless({
       fixture: 'function',
@@ -235,7 +315,7 @@ describe('test/unit/lib/plugins/aws/remove/index.test.js', () => {
 
     expect(listObjectVersionsStub).to.be.calledWithExactly({
       Bucket: 'bucket',
-      Prefix: `serverless/${serverless.service.service}/dev`,
+      Prefix: `serverless/${serverless.service.service}/dev/`,
     });
   });
 
@@ -280,7 +360,7 @@ describe('test/unit/lib/plugins/aws/remove/index.test.js', () => {
 
     expect(listObjectVersionsStub).to.be.calledWithExactly({
       Bucket: 'bucket',
-      Prefix: `serverless/${serverless.service.service}/dev`,
+      Prefix: `serverless/${serverless.service.service}/dev/`,
     });
 
     expect(innerDeleteObjectsStub).to.be.calledWithExactly({
@@ -293,6 +373,103 @@ describe('test/unit/lib/plugins/aws/remove/index.test.js', () => {
         ],
       },
     });
+  });
+
+  it('deletes each page of object versions as it is listed', async () => {
+    const listObjectVersionsStub = sinon
+      .stub()
+      .onFirstCall()
+      .returns({
+        Versions: [{ Key: 'object1', VersionId: 'v1' }],
+        NextKeyMarker: 'next-key',
+        NextVersionIdMarker: 'next-version',
+      })
+      .onSecondCall()
+      .returns({
+        DeleteMarkers: [{ Key: 'object2', VersionId: 'v2' }],
+      });
+    const innerDeleteObjectsStub = sinon.stub().resolves();
+
+    const { serverless } = await runServerless({
+      command: 'remove',
+      fixture: 'function',
+      configExt: {
+        provider: {
+          deploymentPrefix: 'serverless',
+          deploymentBucket: {
+            name: 'bucket',
+            versioning: true,
+          },
+        },
+      },
+      awsRequestStubMap: {
+        ...awsRequestStubMap,
+        S3: {
+          listObjectVersions: listObjectVersionsStub,
+          deleteObjects: innerDeleteObjectsStub,
+          headBucket: {},
+        },
+      },
+    });
+
+    expect(listObjectVersionsStub).to.have.been.calledTwice;
+    expect(listObjectVersionsStub.firstCall.args[0]).to.deep.equal({
+      Bucket: 'bucket',
+      Prefix: `serverless/${serverless.service.service}/dev/`,
+    });
+    expect(listObjectVersionsStub.secondCall.args[0]).to.deep.equal({
+      Bucket: 'bucket',
+      Prefix: `serverless/${serverless.service.service}/dev/`,
+      KeyMarker: 'next-key',
+      VersionIdMarker: 'next-version',
+    });
+    expect(innerDeleteObjectsStub).to.have.been.calledTwice;
+    expect(innerDeleteObjectsStub.firstCall.args[0]).to.deep.equal({
+      Bucket: 'bucket',
+      Delete: {
+        Objects: [{ Key: 'object1', VersionId: 'v1' }],
+      },
+    });
+    expect(innerDeleteObjectsStub.secondCall.args[0]).to.deep.equal({
+      Bucket: 'bucket',
+      Delete: {
+        Objects: [{ Key: 'object2', VersionId: 'v2' }],
+      },
+    });
+    expect(innerDeleteObjectsStub.firstCall.calledAfter(listObjectVersionsStub.firstCall)).to.be
+      .true;
+    expect(listObjectVersionsStub.secondCall.calledAfter(innerDeleteObjectsStub.firstCall)).to.be
+      .true;
+    expect(innerDeleteObjectsStub.secondCall.calledAfter(listObjectVersionsStub.secondCall)).to.be
+      .true;
+  });
+
+  it('should throw an error when cannot list object versions from the bucket', async () => {
+    await expect(
+      runServerless({
+        command: 'remove',
+        fixture: 'function',
+        configExt: {
+          provider: {
+            deploymentBucket: {
+              name: 'bucket',
+              versioning: true,
+            },
+          },
+        },
+        awsRequestStubMap: {
+          ...awsRequestStubMap,
+          S3: {
+            listObjectVersions: () => {
+              const err = new Error('ff');
+              err.providerError = { statusCode: 403 };
+              throw err;
+            },
+            headBucket: {},
+          },
+        },
+      })
+    ).to.be.eventually.rejected.and.have.property('code', 'AWS_S3_LIST_OBJECTS_V2_ACCESS_DENIED');
   });
 
   it('should throw an error when deleteObjects operation was not successfull', async () => {
@@ -319,6 +496,30 @@ describe('test/unit/lib/plugins/aws/remove/index.test.js', () => {
         },
       })
     ).to.be.eventually.rejected.and.have.property('code', 'CANNOT_DELETE_S3_OBJECTS_GENERIC');
+  });
+
+  it('does not rewrite deleteObjects access denied failures as list failures', async () => {
+    const deleteError = new Error('delete denied');
+    deleteError.code = 'AccessDenied';
+
+    try {
+      await runServerless({
+        command: 'remove',
+        fixture: 'function',
+        awsRequestStubMap: {
+          ...awsRequestStubMap,
+          S3: {
+            ...awsRequestStubMap.S3,
+            listObjectsV2: { Contents: [{ Key: 'first' }] },
+            deleteObjects: sinon.stub().rejects(deleteError),
+            headBucket: {},
+          },
+        },
+      });
+      throw new Error('Expected remove to reject');
+    } catch (error) {
+      expect(error).to.equal(deleteError);
+    }
   });
 
   it('should throw an error when deleteObjects operation was not successfull due to "AccessDenied"', async () => {
