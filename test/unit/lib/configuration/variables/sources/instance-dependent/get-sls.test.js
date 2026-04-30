@@ -124,6 +124,54 @@ describe('test/unit/lib/configuration/variables/sources/instance-dependent/get-s
     expect(configuration.custom.stage).to.equal('staging');
   });
 
+  it('should ignore inherited stage from options', async () => {
+    const options = Object.create({ stage: 'foo/bar' });
+    const result = await getSlsSource().resolve({
+      address: 'stage',
+      options,
+      resolveConfigurationProperty: async () => 'prod',
+    });
+
+    expect(result.value).to.equal('prod');
+  });
+
+  it('should treat null stage in options as absent', async () => {
+    await initializeServerless({
+      configExt: {
+        provider: {
+          stage: 'prod',
+        },
+      },
+      options: {
+        stage: null,
+      },
+    });
+
+    expect(configuration.custom.stage).to.equal('prod');
+  });
+
+  it('should report with an error invalid stage from options', async () => {
+    await initializeServerless({
+      options: {
+        stage: 'foo/bar',
+      },
+    });
+
+    expect(variablesMeta.get('custom\0stage').error.code).to.equal('VARIABLE_RESOLUTION_ERROR');
+  });
+
+  it('should report with an error invalid stage from provider configuration', async () => {
+    await initializeServerless({
+      configExt: {
+        provider: {
+          stage: 'feature.prod',
+        },
+      },
+    });
+
+    expect(variablesMeta.get('custom\0stage').error.code).to.equal('VARIABLE_RESOLUTION_ERROR');
+  });
+
   it('should report with an error missing address', async () => {
     await initializeServerless();
     return expect(variablesMeta.get('custom\0missingAddress').error.code).to.equal(
