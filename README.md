@@ -10,10 +10,14 @@ This repository is a maintained alternative to [Serverless Framework](https://gi
 
 <p align="center">
 <a href="https://www.voxie.com/"><img src="docs/sponsors/voxie.svg" width="150px" /></a>
-&nbsp; &nbsp; &nbsp; &nbsp;
-<a href="https://optionmetrics.com/"><img src="docs/sponsors/optionmetrics.png" width="300px" /></a>
-&nbsp; &nbsp; &nbsp; &nbsp;
-<a href="https://www.mybuilder.com/"><img src="docs/sponsors/mybuilder.svg" width="210px" /></a>
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;
+<a href="https://www.flagsmith.com/"><img src="docs/sponsors/flagsmith.png" height="50px" /></a>
+</p>
+
+<p align="center">
+<a href="https://www.mybuilder.com/"><img src="docs/sponsors/mybuilder.svg" height="40px" /></a>
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;
+<a href="https://optionmetrics.com/"><img src="docs/sponsors/optionmetrics.png" height="50px" /></a>
 </p>
 
 This project is open-source and free to use. However, maintaining it requires time and effort. If you want to support the project, you can become a sponsor on GitHub Sponsors.
