@@ -1,12 +1,12 @@
 'use strict';
 
 const { expect } = require('chai');
-const _ = require('lodash');
 
 const resolveMeta = require('../../../../../../../lib/configuration/variables/resolve-meta');
 const resolve = require('../../../../../../../lib/configuration/variables/resolve');
 const selfSource = require('../../../../../../../lib/configuration/variables/sources/self');
 const getSlsSource = require('../../../../../../../lib/configuration/variables/sources/instance-dependent/get-sls');
+const mergePlainObjects = require('../../../../../../../lib/utils/merge-plain-objects');
 const Serverless = require('../../../../../../../lib/serverless');
 
 describe('test/unit/lib/configuration/variables/sources/instance-dependent/get-sls.test.js', () => {
@@ -30,7 +30,7 @@ describe('test/unit/lib/configuration/variables/sources/instance-dependent/get-s
       },
     };
     if (configExt) {
-      configuration = _.merge(configuration, configExt);
+      configuration = mergePlainObjects(configuration, configExt);
     }
     variablesMeta = resolveMeta(configuration);
     serverlessInstance = new Serverless({
@@ -122,6 +122,54 @@ describe('test/unit/lib/configuration/variables/sources/instance-dependent/get-s
       },
     });
     expect(configuration.custom.stage).to.equal('staging');
+  });
+
+  it('should ignore inherited stage from options', async () => {
+    const options = Object.create({ stage: 'foo/bar' });
+    const result = await getSlsSource().resolve({
+      address: 'stage',
+      options,
+      resolveConfigurationProperty: async () => 'prod',
+    });
+
+    expect(result.value).to.equal('prod');
+  });
+
+  it('should treat null stage in options as absent', async () => {
+    await initializeServerless({
+      configExt: {
+        provider: {
+          stage: 'prod',
+        },
+      },
+      options: {
+        stage: null,
+      },
+    });
+
+    expect(configuration.custom.stage).to.equal('prod');
+  });
+
+  it('should report with an error invalid stage from options', async () => {
+    await initializeServerless({
+      options: {
+        stage: 'foo/bar',
+      },
+    });
+
+    expect(variablesMeta.get('custom\0stage').error.code).to.equal('VARIABLE_RESOLUTION_ERROR');
+  });
+
+  it('should report with an error invalid stage from provider configuration', async () => {
+    await initializeServerless({
+      configExt: {
+        provider: {
+          stage: 'feature.prod',
+        },
+      },
+    });
+
+    expect(variablesMeta.get('custom\0stage').error.code).to.equal('VARIABLE_RESOLUTION_ERROR');
   });
 
   it('should report with an error missing address', async () => {

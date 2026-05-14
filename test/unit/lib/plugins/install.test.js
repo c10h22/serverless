@@ -1,15 +1,12 @@
 'use strict';
 
-const chai = require('chai');
 const Serverless = require('../../../../lib/serverless');
 const Install = require('../../../../lib/plugins/install.js');
 const sinon = require('sinon');
 const download = require('../../../../lib/utils/download-template-from-repo');
-const fse = require('fs-extra');
 const path = require('path');
-const { getTmpDirPath } = require('../../../utils/fs');
+const { ensureDirSync, getTmpDirPath } = require('../../../utils/fs');
 
-chai.use(require('sinon-chai'));
 const { expect } = require('chai');
 
 describe('Install', () => {
@@ -23,7 +20,7 @@ describe('Install', () => {
     const tmpDir = getTmpDirPath();
     cwd = process.cwd();
 
-    fse.mkdirsSync(tmpDir);
+    ensureDirSync(tmpDir);
     process.chdir(tmpDir);
 
     serviceDir = tmpDir;
@@ -96,7 +93,7 @@ describe('Install', () => {
       install.options = { url: 'https://github.com/johndoe/existing-service' };
 
       const serviceDirName = path.join(serviceDir, 'existing-service');
-      fse.mkdirsSync(serviceDirName);
+      ensureDirSync(serviceDirName);
 
       try {
         await install.install();
@@ -110,7 +107,10 @@ describe('Install', () => {
       downloadStub.resolves('remote-service');
 
       return install.install().then(() => {
-        expect(downloadStub).to.have.been.calledOnce;
+        expect(downloadStub).to.have.been.calledOnceWithExactly(
+          'https://github.com/johndoe/remote-service',
+          undefined
+        );
       });
     });
 
@@ -120,7 +120,10 @@ describe('Install', () => {
       downloadStub.resolves('remote-service');
 
       return install.install().then(() => {
-        expect(downloadStub).to.have.been.calledOnce;
+        expect(downloadStub).to.have.been.calledOnceWithExactly(
+          'https://github.com/johndoe/remote-service',
+          'remote'
+        );
       });
     });
   });

@@ -1,20 +1,17 @@
 'use strict';
 
-/* eslint-disable no-unused-expressions */
-
 const chai = require('chai');
+const path = require('path');
 const AwsProvider = require('../../../../../../lib/plugins/aws/provider');
 const Serverless = require('../../../../../../lib/serverless');
 const CLI = require('../../../../../../lib/classes/cli');
-const { createTmpDir } = require('../../../../../utils/fs');
+const { createTmpDir, pathExists } = require('../../../../../utils/fs');
 const {
   addCustomResourceToService,
 } = require('../../../../../../lib/plugins/aws/custom-resources/index.js');
 const runServerless = require('../../../../../utils/run-serverless');
 
 const expect = chai.expect;
-chai.use(require('sinon-chai'));
-chai.use(require('chai-as-promised'));
 
 describe('#addCustomResourceToService()', () => {
   let tmpDirPath;
@@ -109,7 +106,7 @@ describe('#addCustomResourceToService()', () => {
         Role: {
           'Fn::GetAtt': ['IamRoleCustomResourcesLambdaExecution', 'Arn'],
         },
-        Runtime: 'nodejs18.x',
+        Runtime: 'nodejs24.x',
         Timeout: 180,
       },
       DependsOn: ['IamRoleCustomResourcesLambdaExecution'],
@@ -128,7 +125,7 @@ describe('#addCustomResourceToService()', () => {
         Role: {
           'Fn::GetAtt': ['IamRoleCustomResourcesLambdaExecution', 'Arn'],
         },
-        Runtime: 'nodejs18.x',
+        Runtime: 'nodejs24.x',
         Timeout: 180,
       },
       DependsOn: ['IamRoleCustomResourcesLambdaExecution'],
@@ -147,7 +144,7 @@ describe('#addCustomResourceToService()', () => {
         Role: {
           'Fn::GetAtt': ['IamRoleCustomResourcesLambdaExecution', 'Arn'],
         },
-        Runtime: 'nodejs18.x',
+        Runtime: 'nodejs24.x',
         Timeout: 180,
       },
       DependsOn: ['IamRoleCustomResourcesLambdaExecution'],
@@ -232,6 +229,7 @@ describe('#addCustomResourceToService()', () => {
       Resources.CustomDashresourceDashexistingDashs3LambdaFunction.Properties.Role, // S3
       Resources.CustomDashresourceDashexistingDashcupLambdaFunction.Properties.Role, // Cognito User Pool
     ]).to.eql([role, role]);
+    expect(Resources.IamRoleCustomResourcesLambdaExecution).to.equal(undefined);
   });
 
   it('should setup CloudWatch Logs when logs.frameworkLambda is true', async () => {
@@ -349,7 +347,7 @@ describe('#addCustomResourceToService()', () => {
   });
 
   it('should use defined runtime', async () => {
-    serverless.service.provider.runtime = 'nodejs24.x';
+    serverless.service.provider.runtime = 'nodejs22.x';
     await Promise.all([
       // add the custom S3 resource
       addCustomResourceToService(provider, 's3', [
@@ -398,13 +396,59 @@ describe('#addCustomResourceToService()', () => {
 
     expect(
       Resources.CustomDashresourceDashexistingDashs3LambdaFunction.Properties.Runtime
-    ).to.equal('nodejs24.x');
+    ).to.equal('nodejs22.x');
     expect(
       Resources.CustomDashresourceDashexistingDashcupLambdaFunction.Properties.Runtime
-    ).to.equal('nodejs24.x');
+    ).to.equal('nodejs22.x');
     expect(
       Resources.CustomDashresourceDasheventDashbridgeLambdaFunction.Properties.Runtime
-    ).to.equal('nodejs24.x');
+    ).to.equal('nodejs22.x');
+  });
+
+  it('should use service.package.deploymentBucket when provided', async () => {
+    serverless.service.package.deploymentBucket = 'custom-bucket';
+
+    await addCustomResourceToService(provider, 's3', iamRoleStatements);
+
+    const { Resources } = serverless.service.provider.compiledCloudFormationTemplate;
+    expect(
+      Resources.CustomDashresourceDashexistingDashs3LambdaFunction.Properties.Code.S3Bucket
+    ).to.equal('custom-bucket');
+  });
+
+  it('should set Architectures from provider.architecture', async () => {
+    serverless.service.provider.architecture = 'arm64';
+    await addCustomResourceToService(provider, 's3', iamRoleStatements);
+
+    const { Resources } = serverless.service.provider.compiledCloudFormationTemplate;
+    expect(
+      Resources.CustomDashresourceDashexistingDashs3LambdaFunction.Properties.Architectures
+    ).to.deep.equal(['arm64']);
+  });
+
+  it('should not set Architectures when provider.architecture is not defined', async () => {
+    await addCustomResourceToService(provider, 's3', iamRoleStatements);
+
+    const { Resources } = serverless.service.provider.compiledCloudFormationTemplate;
+    expect(
+      Resources.CustomDashresourceDashexistingDashs3LambdaFunction.Properties
+    ).to.not.have.property('Architectures');
+  });
+
+  it('creates the package directory before copying the generated zip', async () => {
+    serverless.serviceDir = path.join(tmpDirPath, 'nested', 'service');
+
+    await addCustomResourceToService(provider, 's3', iamRoleStatements);
+
+    expect(
+      await pathExists(
+        path.join(
+          serverless.serviceDir,
+          '.serverless',
+          provider.naming.getCustomResourcesArtifactName()
+        )
+      )
+    ).to.equal(true);
   });
 });
 
@@ -462,27 +506,6 @@ describe('test/unit/lib/plugins/aws/customResources/index.test.js', () => {
 
     const properties =
       cfTemplate.Resources.CustomDashresourceDashexistingDashcupLambdaFunction.Properties;
-    expect(properties.Runtime).to.equal('nodejs24.x');
-  });
-
-  it('falls back to nodejs24 runtime for Event Bridge [LEGACY] custom resource if provider runtime is not nodejs ', async () => {
-    const { cfTemplate } = await runServerless({
-      fixture: 'event-bridge',
-      command: 'package',
-      options: { stage: 'testing' },
-      configExt: {
-        disabledDeprecations: ['AWS_EVENT_BRIDGE_CUSTOM_RESOURCE_LEGACY_OPT_IN'],
-        provider: {
-          runtime: 'python3.12',
-          eventBridge: {
-            useCloudFormation: false,
-          },
-        },
-      },
-    });
-
-    const properties =
-      cfTemplate.Resources.CustomDashresourceDasheventDashbridgeLambdaFunction.Properties;
     expect(properties.Runtime).to.equal('nodejs24.x');
   });
 

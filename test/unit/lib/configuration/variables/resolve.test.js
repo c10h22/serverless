@@ -2,7 +2,7 @@
 
 const { expect } = require('chai');
 
-const wait = require('timers-ext/promise/sleep');
+const wait = require('../../../../../lib/utils/sleep');
 const ServerlessError = require('../../../../../lib/serverless-error');
 const resolveMeta = require('../../../../../lib/configuration/variables/resolve-meta');
 const resolve = require('../../../../../lib/configuration/variables/resolve');
@@ -85,6 +85,17 @@ describe('test/unit/lib/configuration/variables/resolve.test.js', () => {
         '${sourceDeferredNull:, sourceProperty(sharedPropertyRaceCondition1, sharedFinal)}',
       nullWithCustomErrorMessage: '${sourceDirectNull:}',
     };
+    configuration.arraySource = ['one', 'two', 'three'];
+    configuration.arraySourceLength = '${sourceProperty(arraySource, length)}';
+    configuration.inheritedConstructorName =
+      '${sourceProperty(arraySource, constructor, name), null}';
+    configuration.resolvesUnsafeOwnProtoObject = '${sourceResultVariables(protoObject)}';
+    Object.defineProperty(configuration, '__proto__', {
+      value: '${sourceDirect:}',
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
     let variablesMeta;
     const sources = {
       sourceParam: {
@@ -130,6 +141,8 @@ describe('test/unit/lib/configuration/variables/resolve.test.js', () => {
               return { value: { foo: '${sourceDirect:}' } };
             case 'array':
               return { value: [1, '${sourceDirect:}'] };
+            case 'protoObject':
+              return { value: JSON.parse('{"__proto__":"${sourceDirect:}"}') };
             case 'string':
               return { value: '${sourceDirect:}' };
             case 'stringInvalid':
@@ -151,7 +164,7 @@ describe('test/unit/lib/configuration/variables/resolve.test.js', () => {
         resolve: ({ params }) => {
           switch (params && params[0]) {
             case 'non-error-exception':
-              throw null; // eslint-disable-line no-throw-literal
+              throw null;
             case 'serverless-error':
               throw new ServerlessError('Stop');
             case 'circular-ref': {
@@ -287,6 +300,26 @@ describe('test/unit/lib/configuration/variables/resolve.test.js', () => {
       expect(configuration.resolvesResultVariablesObject).to.deep.equal({ foo: 234 });
       expect(configuration.resolvesResultVariablesArray).to.deep.equal([1, 234]);
       expect(configuration.resolvesResultVariablesString).to.equal(234);
+    });
+
+    it('should preserve own unsafe keys when resolving direct configuration properties', () => {
+      expect(Object.getPrototypeOf(configuration)).to.equal(Object.prototype);
+      expect(Object.getOwnPropertyDescriptor(configuration, '__proto__').value).to.equal(234);
+    });
+
+    it('should preserve own unsafe keys when resolving returned result objects', () => {
+      expect(Object.getPrototypeOf(configuration.resolvesUnsafeOwnProtoObject)).to.equal(
+        Object.prototype
+      );
+      expect(
+        Object.getOwnPropertyDescriptor(configuration.resolvesUnsafeOwnProtoObject, '__proto__')
+          .value
+      ).to.equal(234);
+    });
+
+    it('should resolve own array properties while ignoring inherited dependency paths', () => {
+      expect(configuration.arraySourceLength).to.equal(3);
+      expect(configuration.inheritedConstructorName).to.equal(null);
     });
 
     it('should resolve variables in resolved strings which are subject to concatenation', () => {
@@ -533,6 +566,37 @@ describe('test/unit/lib/configuration/variables/resolve.test.js', () => {
       expect(valueMeta.error.code).to.equal('MISSING_VARIABLE_RESULT');
       expect(valueMeta.error.message).to.include('Custom error message from source');
     });
+  });
+
+  it('should memoize identical source resolutions within one batch', async () => {
+    const configuration = {
+      first: '${counted(foo)}',
+      second: '${counted(foo)}',
+    };
+    const variablesMeta = resolveMeta(configuration);
+    let callCount = 0;
+
+    await resolve({
+      serviceDir: process.cwd(),
+      configuration,
+      variablesMeta,
+      sources: {
+        counted: {
+          resolve: ({ params }) => {
+            ++callCount;
+            return { value: `value:${params[0]}` };
+          },
+        },
+      },
+      options: {},
+      fulfilledSources: new Set(),
+    });
+
+    expect(configuration).to.deep.equal({
+      first: 'value:foo',
+      second: 'value:foo',
+    });
+    expect(callCount).to.equal(1);
   });
 
   describe('Partial resolution', () => {

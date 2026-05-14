@@ -8,14 +8,21 @@ const Serverless = require('../../../../../../../../../../lib/serverless');
 const AwsProvider = require('../../../../../../../../../../lib/plugins/aws/provider');
 const ServerlessError = require('../../../../../../../../../../lib/serverless-error');
 
-chai.use(require('chai-as-promised'));
-chai.use(require('sinon-chai'));
-
 const expect = chai.expect;
 
 describe('#validate()', () => {
   let serverless;
   let awsCompileApigEvents;
+
+  afterEach(() => {
+    delete Object.prototype.headers;
+    delete Object.prototype.methods;
+    delete Object.prototype.origins;
+    delete Object.prototype.origin;
+    delete Object.prototype.allowCredentials;
+    delete Object.prototype.maxAge;
+    delete Object.prototype.cacheControl;
+  });
 
   beforeEach(() => {
     const options = {
@@ -617,7 +624,7 @@ describe('#validate()', () => {
     });
   });
 
-  it('should handle expicit methods', () => {
+  it('should handle explicit methods', () => {
     awsCompileApigEvents.serverless.service.functions = {
       first: {
         events: [
@@ -1100,6 +1107,178 @@ describe('#validate()', () => {
     expect(() => awsCompileApigEvents.validate()).to.throw(Error);
   });
 
+  it('should accept transferMode STREAM with AWS_PROXY integration', () => {
+    awsCompileApigEvents.serverless.service.functions = {
+      first: {
+        events: [
+          {
+            http: {
+              method: 'GET',
+              path: 'users/list',
+              integration: 'lambda-proxy',
+              response: {
+                transferMode: 'STREAM',
+              },
+            },
+          },
+        ],
+      },
+    };
+
+    const validated = awsCompileApigEvents.validate();
+    expect(validated.events).to.be.an('Array').with.length(1);
+    expect(validated.events[0].http.response.transferMode).to.equal('STREAM');
+  });
+
+  it('should accept transferMode BUFFERED with AWS_PROXY integration', () => {
+    awsCompileApigEvents.serverless.service.functions = {
+      first: {
+        events: [
+          {
+            http: {
+              method: 'GET',
+              path: 'users/list',
+              integration: 'lambda-proxy',
+              response: {
+                transferMode: 'BUFFERED',
+              },
+            },
+          },
+        ],
+      },
+    };
+
+    const validated = awsCompileApigEvents.validate();
+    expect(validated.events).to.be.an('Array').with.length(1);
+    expect(validated.events[0].http.response.transferMode).to.equal('BUFFERED');
+  });
+
+  it('should normalize transferMode to uppercase', () => {
+    awsCompileApigEvents.serverless.service.functions = {
+      first: {
+        events: [
+          {
+            http: {
+              method: 'GET',
+              path: 'users/list',
+              integration: 'lambda-proxy',
+              response: {
+                transferMode: 'stream',
+              },
+            },
+          },
+        ],
+      },
+    };
+
+    const validated = awsCompileApigEvents.validate();
+    expect(validated.events).to.be.an('Array').with.length(1);
+    expect(validated.events[0].http.response.transferMode).to.equal('STREAM');
+  });
+
+  it('should throw if transferMode is invalid', () => {
+    awsCompileApigEvents.serverless.service.functions = {
+      first: {
+        events: [
+          {
+            http: {
+              method: 'GET',
+              path: 'users/list',
+              integration: 'lambda-proxy',
+              response: {
+                transferMode: 'INVALID',
+              },
+            },
+          },
+        ],
+      },
+    };
+
+    expect(() => awsCompileApigEvents.validate()).to.throw(
+      ServerlessError,
+      'Invalid transferMode "INVALID"'
+    );
+  });
+
+  it('should throw if transferMode is used with non-proxy integration', () => {
+    awsCompileApigEvents.serverless.service.functions = {
+      first: {
+        events: [
+          {
+            http: {
+              method: 'GET',
+              path: 'users/list',
+              integration: 'lambda',
+              response: {
+                transferMode: 'STREAM',
+              },
+            },
+          },
+        ],
+      },
+    };
+
+    expect(() => awsCompileApigEvents.validate()).to.throw(
+      ServerlessError,
+      'transferMode can only be used with AWS_PROXY or HTTP_PROXY integrations'
+    );
+  });
+
+  it('should accept transferMode with HTTP_PROXY integration', () => {
+    awsCompileApigEvents.serverless.service.functions = {
+      first: {
+        events: [
+          {
+            http: {
+              method: 'GET',
+              path: 'users/list',
+              integration: 'HTTP_PROXY',
+              request: {
+                uri: 'https://example.com',
+              },
+              response: {
+                transferMode: 'STREAM',
+              },
+            },
+          },
+        ],
+      },
+    };
+
+    const validated = awsCompileApigEvents.validate();
+    expect(validated.events).to.be.an('Array').with.length(1);
+    expect(validated.events[0].http.response.transferMode).to.equal('STREAM');
+  });
+
+  it('should preserve transferMode but remove other response config with LAMBDA-PROXY', async () => {
+    awsCompileApigEvents.serverless.service.functions = {
+      first: {
+        events: [
+          {
+            http: {
+              method: 'GET',
+              path: 'users/list',
+              integration: 'lambda-proxy',
+              response: {
+                transferMode: 'STREAM',
+                headers: {
+                  'Content-Type': 'text/html',
+                },
+              },
+            },
+          },
+        ],
+      },
+    };
+    return serverless.init().then(() => {
+      sinon.stub(serverless.cli, 'log');
+
+      const validated = awsCompileApigEvents.validate();
+      expect(validated.events).to.be.an('Array').with.length(1);
+      expect(validated.events[0].http.response).to.deep.equal({ transferMode: 'STREAM' });
+    });
+  });
+
   it('should support MOCK integration', () => {
     awsCompileApigEvents.serverless.service.functions = {
       first: {
@@ -1353,11 +1532,7 @@ describe('#validate()', () => {
     };
     expect(() => awsCompileApigEvents.validate()).to.throw(
       ServerlessError,
-      [
-        'Invalid stage name my@stage: it should contains only [-_a-zA-Z0-9]',
-        'for AWS provider if http event are present',
-        'according to API Gateway limitation.',
-      ].join(' ')
+      'Invalid stage name. Stage names may contain only ASCII letters, numbers, and hyphens.'
     );
   });
 
@@ -1409,6 +1584,31 @@ describe('#validate()', () => {
         pattern: '([\\s\\S]*\\[504\\][\\s\\S]*)|(.*Task timed out after \\d+\\.\\d+ seconds$)',
       },
     });
+  });
+
+  it('should keep CORS data for __proto__ paths without touching Object.prototype', () => {
+    awsCompileApigEvents.serverless.service.functions = {
+      first: {
+        events: [
+          {
+            http: {
+              method: 'GET',
+              path: '/__proto__',
+              cors: true,
+            },
+          },
+        ],
+      },
+    };
+
+    const validated = awsCompileApigEvents.validate();
+
+    expect(Object.getPrototypeOf(validated.corsPreflight)).to.equal(null);
+    expect(
+      Object.getOwnPropertyDescriptor(validated.corsPreflight, '__proto__').value.methods
+    ).to.deep.equal(['OPTIONS', 'GET']);
+    expect({}.headers).to.equal(undefined);
+    expect({}.methods).to.equal(undefined);
   });
 });
 

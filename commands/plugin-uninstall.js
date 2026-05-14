@@ -1,16 +1,15 @@
 'use strict';
 
-const spawn = require('child-process-ext/spawn');
+const spawn = require('../lib/utils/spawn');
 const fsp = require('fs').promises;
-const fse = require('fs-extra');
 const path = require('path');
-const _ = require('lodash');
 const isPlainObject = require('type/plain-object/is');
 const yaml = require('js-yaml');
-const cloudformationSchema = require('@serverless/utils/cloudformation-schema');
-const { log, progress, style } = require('@serverless/utils/log');
+const cloudformationSchema = require('../lib/utils/serverless-utils/cloudformation-schema');
+const { log, progress, style } = require('../lib/utils/serverless-utils/log');
 const yamlAstParser = require('../lib/utils/yaml-ast-parser');
 const npmCommandDeferred = require('../lib/utils/npm-command-deferred');
+const { readJson, writeJson } = require('../lib/utils/fs/json-file');
 const {
   getPluginInfo,
   getServerlessFilePath,
@@ -52,14 +51,17 @@ const removePluginFromServerlessFile = async ({ configurationFilePath, pluginNam
   }
 
   if (fileExtension === '.json') {
-    const serverlessFileObj = await fse.readJson(configurationFilePath);
+    const serverlessFileObj = await readJson(configurationFilePath);
     const isArrayPluginsObject = Array.isArray(serverlessFileObj.plugins);
     const plugins = isArrayPluginsObject
       ? serverlessFileObj.plugins
       : serverlessFileObj.plugins && serverlessFileObj.plugins.modules;
 
     if (plugins) {
-      _.pull(plugins, pluginName);
+      for (let index = plugins.indexOf(pluginName); index !== -1; ) {
+        plugins.splice(index, 1);
+        index = plugins.indexOf(pluginName);
+      }
       if (!plugins.length) {
         if (isArrayPluginsObject) {
           delete serverlessFileObj.plugins;
@@ -67,7 +69,7 @@ const removePluginFromServerlessFile = async ({ configurationFilePath, pluginNam
           delete serverlessFileObj.plugins.modules;
         }
       }
-      await fse.writeJson(configurationFilePath, serverlessFileObj);
+      await writeJson(configurationFilePath, serverlessFileObj);
     }
     return;
   }

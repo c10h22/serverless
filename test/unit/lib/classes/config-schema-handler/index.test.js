@@ -2,14 +2,14 @@
 
 const chai = require('chai');
 const runServerless = require('../../../../utils/run-serverless');
+const Serverless = require('../../../../../lib/serverless');
 const {
   getConfigurationValidationResult,
 } = require('../../../../../lib/classes/config-schema-handler');
 
-chai.use(require('chai-as-promised'));
-
 const expect = chai.expect;
 const FUNCTION_NAME_PATTERN = '^[a-zA-Z0-9-_]+$';
+const STAGE_NAME_PATTERN = require('../../../../../lib/utils/stage-pattern');
 
 describe('test/unit/lib/classes/ConfigSchemaHandler/index.test.js', () => {
   describe('#constructor', () => {
@@ -78,6 +78,45 @@ describe('test/unit/lib/classes/ConfigSchemaHandler/index.test.js', () => {
         command: 'info',
       });
       expect(getConfigurationValidationResult(serverless.configurationInput)).to.be.true;
+    });
+
+    it('restores safe null paths and skips unsafe null paths without mutating prototypes', async () => {
+      const serverless = new Serverless({ commands: [], options: {} });
+      const userConfig = JSON.parse(
+        '{"service":"service","frameworkVersion":"*","provider":{"name":"aws"},"custom":{"safe":{"keptNull":null},"__proto__":null,"constructor":{"prototype":{"blockedNull":null}}}}'
+      );
+      serverless.configurationInput = userConfig;
+
+      await serverless.configSchemaHandler.validateConfig(userConfig);
+
+      expect(userConfig.custom.safe.keptNull).to.equal(null);
+      expect(Object.getPrototypeOf(userConfig.custom)).to.equal(Object.prototype);
+      expect(Object.prototype.hasOwnProperty.call(userConfig.custom, '__proto__')).to.equal(false);
+      expect(Object.prototype.hasOwnProperty.call(userConfig.custom, 'constructor')).to.equal(true);
+      expect(userConfig.custom.constructor.prototype.blockedNull).to.equal(undefined);
+      expect({}.blockedNull).to.equal(undefined);
+    });
+
+    it('resolves schema references through own definition keys named constructor', async () => {
+      const serverless = new Serverless({ commands: [], options: {} });
+      const customProperties = serverless.configSchemaHandler.schema.properties.custom.properties;
+
+      serverless.configSchemaHandler.schema.definitions.constructor = { type: 'string' };
+      customProperties.someConstructorBackedValue = {
+        $ref: '#/definitions/constructor',
+      };
+
+      const userConfig = {
+        service: 'service',
+        frameworkVersion: '*',
+        provider: { name: 'aws' },
+        custom: { someConstructorBackedValue: 'ok' },
+      };
+      serverless.configurationInput = userConfig;
+
+      await serverless.configSchemaHandler.validateConfig(userConfig);
+
+      expect(customProperties.someConstructorBackedValue).to.deep.equal({ type: 'string' });
     });
   });
 
@@ -321,7 +360,7 @@ describe('test/unit/lib/classes/ConfigSchemaHandler/index.test.js', () => {
           type: 'object',
           properties: {
             name: { const: 'someProvider' },
-            stage: { type: 'string' },
+            stage: { type: 'string', pattern: STAGE_NAME_PATTERN },
           },
           required: ['name'],
           additionalProperties: false,

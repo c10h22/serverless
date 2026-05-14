@@ -2,11 +2,14 @@
 
 const expect = require('chai').expect;
 const sinon = require('sinon');
+const proxyquire = require('proxyquire');
 const AwsProvider = require('../../../../../lib/plugins/aws/provider');
 const AwsMetrics = require('../../../../../lib/plugins/aws/metrics');
 const Serverless = require('../../../../../lib/serverless');
 const CLI = require('../../../../../lib/classes/cli');
 const dayjs = require('dayjs');
+const { CloudWatchClient, GetMetricStatisticsCommand } = require('@aws-sdk/client-cloudwatch');
+const releasePendingRequestsUntilSettled = require('../../../../utils/release-pending-requests-until-settled');
 
 const LocalizedFormat = require('dayjs/plugin/localizedFormat');
 
@@ -40,7 +43,6 @@ describe('AwsMetrics', () => {
       expect(awsMetrics.provider).to.be.instanceof(AwsProvider));
 
     it('should have a "metrics:metrics" hook', () => {
-      // eslint-disable-next-line no-unused-expressions
       expect(awsMetrics.hooks['metrics:metrics']).to.not.be.undefined;
     });
 
@@ -129,6 +131,14 @@ describe('AwsMetrics', () => {
       expect(translatedDate).to.equal(yesterdaysDate);
     });
 
+    it('should translate minute-based human friendly syntax for startTime', () => {
+      awsMetrics.options.startTime = '30m';
+
+      awsMetrics.extendedValidate();
+
+      expect(awsMetrics.options.startTime).to.be.instanceof(Date);
+    });
+
     it('should set the endTime to today as the default value if not provided', () => {
       awsMetrics.options.endTime = null;
 
@@ -171,11 +181,11 @@ describe('AwsMetrics', () => {
       };
       awsMetrics.options.startTime = new Date('1970-01-01');
       awsMetrics.options.endTime = new Date('1970-01-02');
-      requestStub = sinon.stub(awsMetrics.provider, 'request');
+      requestStub = sinon.stub(CloudWatchClient.prototype, 'send');
     });
 
     afterEach(() => {
-      awsMetrics.provider.request.restore();
+      CloudWatchClient.prototype.send.restore();
     });
 
     it('should gather service wide function metrics if no function option is specified', async () => {
@@ -340,6 +350,57 @@ describe('AwsMetrics', () => {
       expect(result).to.deep.equal(expectedResult);
     });
 
+    it('limits total CloudWatch metric requests to 6 across all functions', async () => {
+      awsMetrics.serverless.service.functions = Object.fromEntries(
+        Array.from({ length: 3 }, (_, index) => [`function${index}`, { name: `func${index}` }])
+      );
+      let activeRequests = 0;
+      let observedMaxActiveRequests = 0;
+      const pendingResolvers = [];
+      requestStub.callsFake(async (command) => {
+        activeRequests += 1;
+        observedMaxActiveRequests = Math.max(observedMaxActiveRequests, activeRequests);
+        expect(activeRequests).to.be.at.most(6);
+        await new Promise((resolve) => pendingResolvers.push(resolve));
+        activeRequests -= 1;
+        return {
+          Label: command.input.MetricName,
+          Datapoints: [],
+        };
+      });
+
+      const promise = awsMetrics.getMetrics();
+
+      for (let index = 0; index < 20 && pendingResolvers.length < 6; index += 1) {
+        await Promise.resolve();
+      }
+      expect(observedMaxActiveRequests).to.equal(6);
+      await releasePendingRequestsUntilSettled(pendingResolvers, promise);
+      expect(observedMaxActiveRequests).to.equal(6);
+    });
+
+    it('reuses one CloudWatch client across repeated metric gathers', async () => {
+      const getAwsSdkV3ConfigSpy = sinon.spy(awsMetrics.provider, 'getAwsSdkV3Config');
+      requestStub.callsFake(async (command) => ({
+        Label: command.input.MetricName,
+        Datapoints: [],
+      }));
+
+      try {
+        await awsMetrics.getMetrics();
+        await awsMetrics.getMetrics();
+
+        expect(getAwsSdkV3ConfigSpy).to.have.been.calledOnce;
+        expect(requestStub).to.have.callCount(16);
+        for (const call of requestStub.getCalls()) {
+          expect(call.args[0]).to.be.instanceOf(GetMetricStatisticsCommand);
+          expect(call.thisValue).to.equal(requestStub.firstCall.thisValue);
+        }
+      } finally {
+        getAwsSdkV3ConfigSpy.restore();
+      }
+    });
+
     it('should gather metrics with 1 hour period for time span < 24 hours', async () => {
       awsMetrics.options.startTime = new Date('1970-01-01T09:00');
       awsMetrics.options.endTime = new Date('1970-01-01T16:00');
@@ -347,11 +408,13 @@ describe('AwsMetrics', () => {
       await awsMetrics.getMetrics();
 
       expect(
-        requestStub.calledWith(
-          sinon.match.string,
-          sinon.match.string,
-          sinon.match.has('Period', 3600)
-        )
+        requestStub
+          .getCalls()
+          .some(
+            (call) =>
+              call.args[0] instanceof GetMetricStatisticsCommand &&
+              call.args[0].input.Period === 3600
+          )
       ).to.equal(true);
     });
 
@@ -362,12 +425,103 @@ describe('AwsMetrics', () => {
       await awsMetrics.getMetrics();
 
       expect(
-        requestStub.calledWith(
-          sinon.match.string,
-          sinon.match.string,
-          sinon.match.has('Period', 24 * 3600)
-        )
+        requestStub
+          .getCalls()
+          .some(
+            (call) =>
+              call.args[0] instanceof GetMetricStatisticsCommand &&
+              call.args[0].input.Period === 24 * 3600
+          )
       ).to.equal(true);
+    });
+
+    it('should gather metrics with 1 hour period for exactly 24 hours', async () => {
+      awsMetrics.options.startTime = new Date('1970-01-01T00:00:00.000Z');
+      awsMetrics.options.endTime = new Date('1970-01-02T00:00:00.000Z');
+
+      await awsMetrics.getMetrics();
+
+      expect(
+        requestStub
+          .getCalls()
+          .some(
+            (call) =>
+              call.args[0] instanceof GetMetricStatisticsCommand &&
+              call.args[0].input.Period === 3600
+          )
+      ).to.equal(true);
+    });
+  });
+
+  describe('#showMetrics()', () => {
+    it('aggregates datapoints across functions and prints rounded output', () => {
+      const writeTextStub = sinon.stub();
+      const AwsMetricsProxy = proxyquire
+        .noCallThru()
+        .load('../../../../../lib/plugins/aws/metrics', {
+          '../../utils/serverless-utils/log': {
+            writeText: writeTextStub,
+            style: {
+              aside: (value) => value,
+            },
+          },
+        });
+
+      const proxiedMetrics = new AwsMetricsProxy(serverless, {
+        stage: 'dev',
+        region: 'us-east-1',
+      });
+
+      proxiedMetrics.options.startTime = new Date('1970-01-01T00:00:00.000Z');
+      proxiedMetrics.options.endTime = new Date('1970-01-01T01:00:00.000Z');
+
+      proxiedMetrics.showMetrics([
+        [
+          { Label: 'Invocations', Datapoints: [{ Sum: 3 }, { Sum: 2 }] },
+          { Label: 'Errors', Datapoints: [{ Sum: 1 }] },
+          { Label: 'Duration', Datapoints: [{ Average: 100 }, { Average: 200 }] },
+        ],
+        [
+          { Label: 'Invocations', Datapoints: [{ Sum: 4 }] },
+          { Label: 'Throttles', Datapoints: [{ Sum: 1 }] },
+          { Label: 'Duration', Datapoints: [{ Average: 50 }] },
+        ],
+      ]);
+
+      expect(writeTextStub).to.have.been.calledOnce;
+      expect(writeTextStub.firstCall.args[0]).to.include('invocations: 9');
+      expect(writeTextStub.firstCall.args[0]).to.include('throttles: 1');
+      expect(writeTextStub.firstCall.args[0]).to.include('errors: 1');
+      expect(writeTextStub.firstCall.args[0]).to.include('duration (avg.): 116.67ms');
+    });
+
+    it('prints the empty-state message when there are no metrics', () => {
+      const writeTextStub = sinon.stub();
+      const AwsMetricsProxy = proxyquire
+        .noCallThru()
+        .load('../../../../../lib/plugins/aws/metrics', {
+          '../../utils/serverless-utils/log': {
+            writeText: writeTextStub,
+            style: {
+              aside: (value) => value,
+            },
+          },
+        });
+
+      const proxiedMetrics = new AwsMetricsProxy(serverless, {
+        stage: 'dev',
+        region: 'us-east-1',
+      });
+
+      proxiedMetrics.options.startTime = new Date('1970-01-01T00:00:00.000Z');
+      proxiedMetrics.options.endTime = new Date('1970-01-01T01:00:00.000Z');
+
+      proxiedMetrics.showMetrics([]);
+
+      expect(writeTextStub).to.have.been.calledOnce;
+      expect(writeTextStub.firstCall.args[0]).to.include(
+        'There are no metrics to show for these options'
+      );
     });
   });
 });

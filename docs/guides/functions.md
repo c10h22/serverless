@@ -12,7 +12,7 @@ service: myService
 
 provider:
   name: aws
-  runtime: nodejs18.x
+  runtime: nodejs24.x
   runtimeManagement: auto # optional, set how Lambda controls all functions runtime. AWS default is auto; this can either be 'auto' or 'onFunctionUpdate'. For 'manual', see example in hello function below (syntax for both is identical)
   memorySize: 512 # optional, in MB, default is 1024
   timeout: 10 # optional, in seconds, default is 6
@@ -25,7 +25,7 @@ functions:
     handler: handler.hello # required, handler set in AWS Lambda
     name: ${sls:stage}-lambdaName # optional, Deployed Lambda name
     description: Description of what the lambda function does # optional, Description to publish to AWS
-    runtime: python3.11 # optional overwrite, default is provider runtime
+    runtime: python3.14 # optional overwrite, default is provider runtime
     runtimeManagement:
       mode: manual # syntax required for manual, mode property also supports 'auto' or 'onFunctionUpdate' (see provider.runtimeManagement)
       arn: <aws runtime arn> # required when mode is manual
@@ -36,11 +36,17 @@ functions:
     tracing: PassThrough # optional, overwrite, can be 'Active' or 'PassThrough'
 ```
 
+If `provider.runtime` is omitted for AWS services, osls defaults to the latest supported Node.js Lambda runtime. Today that is `nodejs24.x`.
+
+We still recommend explicitly setting the runtime you want to deploy, either at `provider.runtime` or per function, so your service does not change runtimes when that default advances.
+
+For new services, prefer `nodejs24.x`, `python3.14`, `java25`, `dotnet10`, `ruby4.0`, and `provided.al2023` for custom runtimes.
+
 The `handler` property points to the file and module containing the code you want to run in your function.
 
 ```javascript
 // handler.js
-module.exports.functionOne = function (event, context, callback) {};
+module.exports.functionOne = async (event) => {};
 ```
 
 You can add as many functions as you want within this property.
@@ -52,7 +58,7 @@ service: myService
 
 provider:
   name: aws
-  runtime: nodejs18.x
+  runtime: nodejs24.x
 
 functions:
   functionOne:
@@ -72,7 +78,7 @@ service: myService
 
 provider:
   name: aws
-  runtime: nodejs18.x
+  runtime: nodejs24.x
   memorySize: 512 # will be inherited by all functions
 
 functions:
@@ -88,7 +94,7 @@ service: myService
 
 provider:
   name: aws
-  runtime: nodejs18.x
+  runtime: nodejs24.x
 
 functions:
   functionOne:
@@ -124,7 +130,7 @@ service: myService
 
 provider:
   name: aws
-  runtime: nodejs18.x
+  runtime: nodejs24.x
   iam:
     role:
       statements: # permissions for all of your functions can be set here
@@ -291,14 +297,16 @@ functions:
 
 Alternatively lambda environment can be configured through docker images. Image published to AWS ECR registry can be referenced as lambda source (check [AWS Lambda – Container Image Support](https://aws.amazon.com/blogs/aws/new-for-aws-lambda-container-image-support/)). In addition, you can also define your own images that will be built locally and uploaded to AWS ECR registry.
 
-Serverless will create an ECR repository for your image, but it currently does not manage updates to it. An ECR repository is created only for new services or the first time that a function configured with an `image` is deployed. In service configuration, you can configure the ECR repository to scan for CVEs via the `provider.ecr.scanOnPush` property, which is `false` by default. (See [documentation](https://docs.aws.amazon.com/AmazonECR/latest/userguide/image-scanning.html))
+osls will create an ECR repository for your image, but it currently does not manage updates to it. An ECR repository is created only for new services or the first time that a function configured with an `image` is deployed. In service configuration, you can configure the ECR repository to scan for CVEs via the `provider.ecr.scanOnPush` property, which is `false` by default. (See [documentation](https://docs.aws.amazon.com/AmazonECR/latest/userguide/image-scanning.html))
+
+You can also configure an ECR lifecycle policy to automatically clean up old images by setting `provider.ecr.maxImageCount` to a positive integer. When set, images exceeding this count will be expired. (See [documentation](https://docs.aws.amazon.com/AmazonECR/latest/userguide/LifecyclePolicies.html))
 
 In service configuration, images can be configured via `provider.ecr.images`. To define an image that will be built locally, you need to specify `path` property, which should point to valid docker context directory. Optionally, you can also set `file` to specify Dockerfile that should be used when building an image. It is also possible to define images that already exist in AWS ECR repository. In order to do that, you need to define `uri` property, which should follow `<account>.dkr.ecr.<region>.amazonaws.com/<repository>@<digest>` or `<account>.dkr.ecr.<region>.amazonaws.com/<repository>:<tag>` format.
 
 Additionally, you can define arguments that will be passed to the `docker build` command via the following properties:
 
 - `buildArgs`: With the `buildArgs` property, you can define arguments that will be passed to `docker build` command with `--build-arg` flag. They might be later referenced via `ARG` within your `Dockerfile`. (See [Documentation](https://docs.docker.com/engine/reference/builder/#arg))
-- `buildOptions`: With the `buildOptions` property, you can define options that will be passed to the `docker build` command. (See [Documentation](https://docs.docker.com/engine/reference/commandline/image_build/#options))
+- `buildOptions`: With the `buildOptions` property, you can define options that will be passed directly to the `docker build` command. Treat `buildOptions` as trusted input. Options such as `--ssh`, `--secret`, `--network`, `--add-host`, and additional build contexts can expose local resources or alter Docker build isolation. Do not run deployments or packaging for untrusted projects, templates, or pull requests that define Docker build options, and avoid placing secret values directly in `buildOptions` or `buildArgs` because command arguments may appear in local logs or error output. (See [Documentation](https://docs.docker.com/engine/reference/commandline/image_build/#options))
 - `cacheFrom`: The `cacheFrom` property can be used to specify which images to use as a source for layer caching in the `docker build` command with `--cache-from` flag. (See [Documentation](https://docs.docker.com/engine/reference/builder/#usage))
 - `platform`: The `platform` property can be used to specify the architecture target in the `docker build` command with the `--platform` flag. If not specified, Docker will build for your computer's architecture by default. AWS Lambda typically uses `x86` architecture unless otherwise specified in the Lambda's runtime settings. In order to avoid runtime errors when building on an ARM-based machine (e.g. Apple M1 Mac), `linux/amd64` must be used here. The options for this flag are `linux/amd64` (`x86`-based Lambdas), `linux/arm64` (`arm`-based Lambdas), or `windows/amd64`. (See [Documentation](https://docs.docker.com/engine/reference/builder/#from))
 - `provenance` Use the `provenance` property to disable multi-architecture manifest generated from BuildKit or `docker buildx`, allows the architecture specified in `platform` to be recognized by AWS Lambda during deployment.
@@ -313,6 +321,7 @@ provider:
   name: aws
   ecr:
     scanOnPush: true
+    maxImageCount: 10
     images:
       baseimage:
         path: ./path/to/context
@@ -382,7 +391,7 @@ functions:
         - flag
 ```
 
-During the first deployment when locally built images are used, Framework will automatically create a dedicated ECR repository to store these images, with name `serverless-<service>-<stage>`. Currently, the Framework will not remove older versions of images uploaded to ECR as they still might be in use by versioned functions. During `sls remove`, the created ECR repository will be removed. During deployment, Framework will attempt to `docker login` to ECR if needed. Depending on your local configuration, docker authorization token might be stored unencrypted. Please refer to documentation for more details: https://docs.docker.com/engine/reference/commandline/login/#credentials-store
+During the first deployment when locally built images are used, the CLI will automatically create a dedicated ECR repository to store these images, with name `serverless-<service>-<stage>`. By default, older versions of images uploaded to ECR are not removed as they still might be in use by versioned functions. To automatically expire old images, set `provider.ecr.maxImageCount` to limit the number of images retained in the repository. During `sls remove`, the created ECR repository will be removed. During deployment, the CLI will attempt to `docker login` to ECR if needed. Depending on your local configuration, docker authorization token might be stored unencrypted. Please refer to documentation for more details: https://docs.docker.com/engine/reference/commandline/login/#credentials-store
 
 ## Instruction set architecture
 
@@ -434,7 +443,7 @@ Finally, `auto` and `onFunctionUpdate` can be set as the `mode` property as well
 
 ## SnapStart
 
-[Lambda SnapStart](https://docs.aws.amazon.com/lambda/latest/dg/snapstart.html) for Java can improve startup performance for latency-sensitive applications.
+[Lambda SnapStart](https://docs.aws.amazon.com/lambda/latest/dg/snapstart.html) can improve startup performance for latency-sensitive applications on supported runtimes.
 
 To enable SnapStart for your lambda function you can add the `snapStart` object property in the function configuration which can be put to true and will result in the value `PublishedVersions` for this function.
 
@@ -442,11 +451,22 @@ To enable SnapStart for your lambda function you can add the `snapStart` object 
 functions:
   hello:
     ...
-    runtime: java11
+    runtime: java25
     snapStart: true
 ```
 
-**Note:** Lambda SnapStart only supports the Java 11, Java 17 and Java 21 runtimes and does not support provisioned concurrency, the arm64 architecture, the Lambda Extensions API, Amazon Elastic File System (Amazon EFS), AWS X-Ray, or ephemeral storage greater than 512 MB.
+**Note:** SnapStart support and limitations are defined by AWS and may change over time. See the [AWS SnapStart documentation](https://docs.aws.amazon.com/lambda/latest/dg/snapstart.html) for the current supported runtimes and restrictions.
+
+## Recursive Loop Detection
+
+By default, AWS Lambda [detects and stops recursive invocation loops](https://docs.aws.amazon.com/lambda/latest/dg/invocation-recursion.html) between supported AWS services. To allow recursive loops for a function, set `recursiveLoop` to `Allow`. To explicitly enforce termination (the default behavior), set it to `Terminate`.
+
+```yaml
+functions:
+  hello:
+    handler: handler.hello
+    recursiveLoop: Allow
+```
 
 ## AWS Lambda Durable Functions
 
@@ -714,7 +734,7 @@ functions:
 Real-world use cases where tagging your functions is helpful include:
 
 - Cost estimations (tag functions with an environment tag: `environment: Production`)
-- Keeping track of legacy code (e.g. tag functions which use outdated runtimes: `runtime: nodejs0.10`)
+- Keeping track of legacy code (e.g. tag functions which use outdated runtimes: `runtime: legacy`)
 - ...
 
 ## Layers
@@ -730,14 +750,14 @@ functions:
       - arn:aws:lambda:region:XXXXXX:layer:LayerName:Y
 ```
 
-Layers can be used in combination with `runtime: provided` to implement your own custom runtime on
+Layers can be used in combination with `runtime: provided.al2023` to implement your own custom runtime on
 AWS Lambda.
 
 To publish Lambda Layers, check out the [Layers](./layers.md) documentation.
 
 ## Log Group Resources
 
-By default, the framework will create LogGroups for your Lambdas. This makes it easy to clean up your log groups in the case you remove your service, and make the lambda IAM permissions much more specific and secure.
+By default, osls will create LogGroups for your Lambdas. This makes it easy to clean up your log groups in the case you remove your service, and make the lambda IAM permissions much more specific and secure.
 
 You can opt out of the default behavior by setting `disableLogs: true`
 
@@ -759,9 +779,9 @@ functions:
 
 ## Versioning Deployed Functions
 
-By default, the framework creates function versions for every deploy. This behavior is optional, and can be turned off in cases where you don't invoke past versions by their qualifier. If you would like to do this, you can invoke your functions as `arn:aws:lambda:....:function/myFunc:3` to invoke version 3 for example.
+By default, osls creates function versions for every deploy. This behavior is optional, and can be turned off in cases where you don't invoke past versions by their qualifier. If you would like to do this, you can invoke your functions as `arn:aws:lambda:....:function/myFunc:3` to invoke version 3 for example.
 
-Versions are not cleaned up by serverless, so make sure you use a plugin or other tool to prune sufficiently old versions. The framework can't clean up versions because it doesn't have information about whether older versions are invoked or not. This feature adds to the number of total stack outputs and resources because a function version is a separate resource from the function it refers to.
+Versions are not cleaned up by osls, so make sure you use a plugin or other tool to prune sufficiently old versions. osls can't clean up versions because it doesn't have information about whether older versions are invoked or not. This feature adds to the number of total stack outputs and resources because a function version is a separate resource from the function it refers to.
 
 To turn off function versioning, set the provider-level option `versionFunctions`.
 
@@ -787,7 +807,7 @@ service: service
 
 provider:
   name: aws
-  runtime: nodejs18.x
+  runtime: nodejs24.x
 
 functions:
   hello:
@@ -840,7 +860,7 @@ service: myService
 
 provider:
   name: aws
-  runtime: nodejs18.x
+  runtime: nodejs24.x
   tracing:
     lambda: true
 ```
@@ -958,23 +978,3 @@ functions:
       logGroup: helloLoggingLogGroup
       systemLogLevel: DEBUG
 ```
-
-## Lambda Hashing Algorithm migration
-
-**Note** Below migration guide is intended to be used if you are already using `v3` version of the Framework and you have `provider.lambdaHashingVersion` property set to `20200924` in your configuration file. If you are still on v2 and want to upgrade to v3, please refer to [V3 Upgrade docs](../../../guides/upgrading-v3.md#lambda-hashing-algorithm).
-
-In `v3`, Lambda version hashes are generated using an improved algorithm that fixes determinism issues. If you are still using the old hashing algorithm, you can follow the guide below to migrate to new default version.
-
-Please keep in mind that these changes require two deployments with manual configuration adjustment between them. It also creates two additional versions and temporarily overrides descriptions of your functions. Migration will need to be done separately for each of your environments/stages.
-
-1. Run `sls deploy` with additional `--enforce-hash-update` flag: that flag will override the description for Lambda functions, which will force the creation of new versions.
-2. Remove `provider.lambdaHashingVersion` setting from your configuration: your service will now always deploy with the new Lambda version hashes (which is the new default in v3).
-3. Run `sls deploy`, this time without additional `--enforce-hash-update` flag: that will restore the original descriptions on all Lambda functions.
-
-Now your whole service is fully migrated to the new Lambda Hashing Algorithm.
-
-If you do not want to temporarily override descriptions of your functions or would like to avoid creating unnecessary versions of your functions, you might want to use one of the following approaches:
-
-- Ensure that code for all your functions will change during deployment, remove `provider.lambdaHashingVersion` from your configuration, and run `sls deploy`. Due to the fact that all functions have code changed, all your functions will be migrated to new hashing algorithm. Please note that the change can be caused by e.g. upgrading a dependency used by all your functions so you can pair it with regular chores.
-- Add a dummy file that will be included in deployment artifacts for all your functions, remove `provider.lambdaHashingVersion` from your configuration, and run `sls deploy`. Due to the fact that all functions have code changed, all your functions will be migrated to new hashing algorithm.
-- If it is safe in your case (e.g. it's only development sandbox), you can also tear down the whole service by `sls remove`, remove `provider.lambdaHashingVersion` from your configuration, and run `sls deploy`. Newly recreated environment will be using new hashing algorithm.

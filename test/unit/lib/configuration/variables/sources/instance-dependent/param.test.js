@@ -13,6 +13,7 @@ describe('test/unit/lib/configuration/variables/sources/instance-dependent/param
     cliParameters = [],
     stageParameters = {},
     stage,
+    resolverOptions,
     resolveWithoutInstance = false,
   } = {}) => {
     const configuration = {
@@ -56,7 +57,7 @@ describe('test/unit/lib/configuration/variables/sources/instance-dependent/param
         self: selfSource,
         param: getParamSource(resolveWithoutInstance ? null : serverlessInstance),
       },
-      options: {
+      options: resolverOptions || {
         param: cliParameters,
       },
       fulfilledSources: new Set(['self', 'param']),
@@ -128,6 +129,51 @@ describe('test/unit/lib/configuration/variables/sources/instance-dependent/param
     expect(configuration.provider.region).to.equal('eu-west-2');
   });
 
+  it('should ignore inherited stage from resolver options', async () => {
+    const options = Object.create({ stage: 'foo/bar' });
+    const result = await getParamSource({
+      configurationInput: {
+        params: {
+          staging: {
+            timeout: 10,
+          },
+          default: {
+            timeout: 5,
+          },
+        },
+      },
+      processedInput: {
+        options: {},
+      },
+    }).resolve({
+      address: 'timeout',
+      options,
+      resolveConfigurationProperty: async () => 'staging',
+    });
+
+    expect(result.value).to.equal(10);
+  });
+
+  it('should treat null stage in resolver options as absent', async () => {
+    const { configuration } = await runServerless({
+      resolverOptions: {
+        param: [],
+        stage: null,
+      },
+      stage: 'staging',
+      stageParameters: {
+        staging: {
+          timeout: 10,
+        },
+        default: {
+          timeout: 5,
+        },
+      },
+    });
+
+    expect(configuration.provider.timeout).to.equal(10);
+  });
+
   it('should report with an error when the CLI parameter is invalid', async () => {
     const { variablesMeta } = await runServerless({
       cliParameters: ['region'],
@@ -153,6 +199,21 @@ describe('test/unit/lib/configuration/variables/sources/instance-dependent/param
   it('should report with an error when the address it not a string', async () => {
     const { variablesMeta } = await runServerless();
     expect(variablesMeta.get('custom\0nonStringAddress').error.code).to.equal(
+      'VARIABLE_RESOLUTION_ERROR'
+    );
+  });
+
+  it('should report with an error when stage is invalid', async () => {
+    const { variablesMeta } = await runServerless({
+      stage: 'foo/bar',
+      stageParameters: {
+        default: {
+          bucket: 'fallback-bucket',
+        },
+      },
+    });
+
+    expect(variablesMeta.get('provider\0deploymentBucket').error.code).to.equal(
       'VARIABLE_RESOLUTION_ERROR'
     );
   });

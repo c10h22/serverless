@@ -1,12 +1,9 @@
 'use strict';
 
-const chai = require('chai');
 const path = require('path');
-const spawn = require('child-process-ext/spawn');
+const spawn = require('../../../lib/utils/spawn');
 const { expect } = require('chai');
 const fixturesEngine = require('../../fixtures/programmatic');
-
-chai.use(require('chai-as-promised'));
 
 const serverlessPath = path.resolve(__dirname, '../../../scripts/serverless.js');
 
@@ -29,8 +26,11 @@ describe('test/unit/commands/doctor.test.js', async () => {
     await spawn('node', [serverlessPath, 'print'], { cwd: serviceDir });
 
     // Gather Health status
-    expect(String((await spawn('node', [serverlessPath, 'doctor'])).stdoutBuffer)).to.include(
-      'deprecation triggered in the last command'
+    const output = String((await spawn('node', [serverlessPath, 'doctor'])).stdoutBuffer);
+
+    expect(output).to.include('deprecation triggered in the last command');
+    expect(output).to.include(
+      'More info: https://github.com/oss-serverless/osls/blob/main/docs/guides/deprecations.md#AWS_HTTP_API_USE_PROVIDER_TAGS_PROPERTY'
     );
   });
 

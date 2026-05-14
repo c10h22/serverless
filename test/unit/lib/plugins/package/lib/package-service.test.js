@@ -1,16 +1,16 @@
 'use strict';
 
+const os = require('os');
 const path = require('path');
 const fsp = require('fs').promises;
-const chai = require('chai');
+const proxyquire = require('proxyquire').noCallThru();
 const sinon = require('sinon');
 const { listFileProperties, listZipFiles } = require('../../../../../utils/fs');
 const runServerless = require('../../../../../utils/run-serverless');
 const fixtures = require('../../../../../fixtures/programmatic');
+const packageService = require('../../../../../../lib/plugins/package/lib/package-service');
 
 // Configure chai
-chai.use(require('chai-as-promised'));
-chai.use(require('sinon-chai'));
 const { expect } = require('chai');
 
 describe('test/unit/lib/plugins/package/lib/packageService.test.js', () => {
@@ -31,6 +31,35 @@ describe('test/unit/lib/plugins/package/lib/packageService.test.js', () => {
       },
     },
   };
+
+  describe('#getRuntime()', () => {
+    it('should default to "nodejs24.x" when no runtime is configured', () => {
+      expect(
+        packageService.getRuntime.call({ serverless: { service: { provider: {} } } }, undefined)
+      ).to.equal('nodejs24.x');
+    });
+  });
+
+  describe('#resolveFilePathsFromPatterns()', () => {
+    it('preserves file names named like __proto__', async () => {
+      const packageServiceWithStubbedGlob = proxyquire(
+        '../../../../../../lib/plugins/package/lib/package-service',
+        {
+          '../../../utils/glob': sinon.stub().resolves(['__proto__', 'keep.js']),
+        }
+      );
+
+      const filePaths = await packageServiceWithStubbedGlob.resolveFilePathsFromPatterns.call(
+        { serverless: { serviceDir: process.cwd() } },
+        {
+          include: [],
+          exclude: [],
+        }
+      );
+
+      expect(filePaths).to.deep.equal(['__proto__', 'keep.js']);
+    });
+  });
 
   describe('service wide', () => {
     let serverless;
@@ -95,12 +124,12 @@ describe('test/unit/lib/plugins/package/lib/packageService.test.js', () => {
       expect(serviceZippedFiles).to.not.include('.serverless-plugins/index.js');
     });
 
-    it('should support `package.exclude`', () => {
+    it('should support exclusion via `package.patterns`', () => {
       expect(serviceZippedFiles, fnIndividualZippedFiles).to.not.include('dir1/subdir1/index.js');
       expect(serviceZippedFiles, fnIndividualZippedFiles).to.include('dir1/subdir3/index.js');
     });
 
-    it('should support `package.include`', () => {
+    it('should support inclusion via `package.patterns`', () => {
       expect(serviceZippedFiles, fnIndividualZippedFiles).to.include('dir1/subdir2/index.js');
       expect(serviceZippedFiles, fnIndividualZippedFiles).to.not.include(
         'dir1/subdir2/subsubdir1/index.js'
@@ -116,24 +145,26 @@ describe('test/unit/lib/plugins/package/lib/packageService.test.js', () => {
       );
     });
 
-    it('should support `functions[].package.exclude`', () => {
+    it('should support function-level exclusion via `functions[].package.patterns`', () => {
       expect(fnIndividualZippedFiles).to.not.include('dir3/index.js');
     });
 
-    it('should support `functions[].package.include`', () => {
+    it('should support function-level inclusion via `functions[].package.patterns`', () => {
       expect(fnIndividualZippedFiles).to.include('dir1/subdir4/index.js');
     });
 
     (process.platform === 'win32' ? it : it.skip)(
-      'should mark go runtime handler files as executable on windows',
+      'should force packaged files to be executable on windows',
       () => {
-        expect(fnFileProperties['main.go'].unixPermissions).to.equal(Math.pow(2, 15) + 0o755);
+        expect(fnFileProperties['index.js'].unixPermissions).to.equal(Math.pow(2, 15) + 0o755);
       }
     );
 
     it('should package layer', () => {
       expect(fnLayerFiles).to.include('layer-module-1.js');
       expect(fnLayerFiles).to.include('layer-module-2.js');
+      expect(fnLayerFiles).to.not.include('layer/layer-module-1.js');
+      expect(fnLayerFiles).to.not.include('layer/layer-module-2.js');
     });
   });
 
@@ -159,6 +190,45 @@ describe('test/unit/lib/plugins/package/lib/packageService.test.js', () => {
 
       expect(zippedFiles).to.not.include('.env');
       expect(zippedFiles).to.not.include('.env.stage');
+    });
+  });
+
+  describe('#packageLayer()', () => {
+    it('resolves layer package paths against serviceDir instead of cwd', async () => {
+      const originalCwd = process.cwd();
+      const cwd = await fsp.mkdtemp(path.join(os.tmpdir(), 'sls-cwd-'));
+      const serviceDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'sls-service-'));
+
+      try {
+        process.chdir(cwd);
+
+        const layerObject = { path: 'layer' };
+        const zipFilesStub = sinon.stub().resolves('layer.zip');
+
+        await packageService.packageLayer.call(
+          {
+            serverless: {
+              serviceDir,
+              service: {
+                getLayer: () => layerObject,
+              },
+            },
+            resolveFilePathsLayer: sinon.stub().resolves(['index.js']),
+            zipFiles: zipFilesStub,
+          },
+          'layer'
+        );
+
+        expect(zipFilesStub).to.have.been.calledWithExactly(
+          [path.join(serviceDir, 'layer', 'index.js')],
+          'layer.zip',
+          path.join(serviceDir, 'layer')
+        );
+      } finally {
+        process.chdir(originalCwd);
+        await fsp.rm(cwd, { recursive: true, force: true });
+        await fsp.rm(serviceDir, { recursive: true, force: true });
+      }
     });
   });
 
@@ -215,13 +285,13 @@ describe('test/unit/lib/plugins/package/lib/packageService.test.js', () => {
       );
     });
 
-    it('should support `package.exclude`', () => {
+    it('should support exclusion via `package.patterns`', () => {
       expect(fnIndividualZippedFiles).to.not.include('dir1/subdir1/index.js');
       expect(fnIndividualZippedFiles).to.not.include('dir1/subdir1/index.js');
       expect(fnIndividualZippedFiles).to.include('dir1/subdir3/index.js');
     });
 
-    it('should support `package.include`', () => {
+    it('should support inclusion via `package.patterns`', () => {
       expect(fnIndividualZippedFiles).to.include('dir1/subdir2/index.js');
       expect(fnIndividualZippedFiles).to.not.include('dir1/subdir2/subsubdir1/index.js');
       expect(fnIndividualZippedFiles).to.include('dir1/subdir2/subsubdir2/index.js');

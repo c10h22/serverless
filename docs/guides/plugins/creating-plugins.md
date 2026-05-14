@@ -11,7 +11,7 @@ Creating a custom plugin lets you:
 
 ## Creating a plugin
 
-The simplest way to create a Serverless Framework plugin is to write a JavaScript file:
+The simplest way to create an osls plugin is to write a JavaScript file:
 
 ```javascript
 'use strict';
@@ -50,13 +50,13 @@ To correctly configure the plugin's NPM package, set the `main` property to poin
 }
 ```
 
-It is also a good practice to add `serverless` to the `peerDependencies` section. That ensures that your plugin runs only with the Serverless Framework versions it supports.
+It is also a good practice to add `osls` to the `peerDependencies` section. That ensures that your plugin runs only with the osls versions it supports.
 
 ```json
 {
   ...
   "peerDependencies": {
-    "serverless": "^2.60 || 3"
+    "osls": "^3.67"
   }
 }
 ```
@@ -140,6 +140,25 @@ module.exports = MyPlugin;
 
 **Note:** configuration values are only resolved _after_ plugins are initialized. Do not try to read configuration in the plugin constructor, as variables aren't resolved yet. Read configuration in lifecycle events only.
 
+## Constructor-injected utilities
+
+osls may pass utility helpers as the third constructor argument:
+
+```javascript
+class MyPlugin {
+  constructor(serverless, options, { log, progress, writeText }) {
+    this.serverless = serverless;
+    this.options = options;
+    this.log = log;
+    this.progress = progress;
+    this.writeText = writeText;
+  }
+}
+```
+
+Use these injected helpers for CLI I/O instead of relying on undocumented
+osls internals.
+
 ## CLI options
 
 The `options` parameter provides access to the CLI options provided to the command:
@@ -157,7 +176,7 @@ class MyPlugin {
 
 Plugins can be provider specific, which means that run only with a specific provider.
 
-**Note:** Binding a plugin to a provider is optional. Serverless will always consider your plugin if you don't specify a `provider`.
+**Note:** Binding a plugin to a provider is optional. osls will always consider your plugin if you don't specify a `provider`.
 
 To bind to a specific provider, retrieve it and set the `this.provider` property in the plugin constructor:
 
@@ -174,9 +193,110 @@ class MyPlugin {
 
 The plugin will now only be executed when the service's provider matches the given provider.
 
+## AWS plugins
+
+AWS plugins should create and own the AWS SDK v3 clients they use. osls
+provides provider-resolved AWS client configuration through
+`provider.getAwsSdkV3Config()`, so plugins can use the same region, credentials,
+retry, proxy, custom CA, and timeout behavior as osls.
+
+### Install SDK client packages
+
+Declare every AWS SDK v3 package your plugin imports. Do not rely on SDK packages
+that happen to be installed by osls.
+
+If your published plugin imports SDK clients at runtime, declare them in
+`dependencies`:
+
+```json
+{
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.975.0"
+  }
+}
+```
+
+If your plugin publishes a self-contained bundle that includes SDK client code,
+declare those clients in `devDependencies` instead and make sure your bundler
+does not externalize them:
+
+```json
+{
+  "devDependencies": {
+    "@aws-sdk/client-s3": "^3.975.0"
+  }
+}
+```
+
+### Configure clients
+
+Use `provider.getAwsSdkV3Config()` when constructing AWS SDK v3 clients:
+
+```javascript
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+
+class MyPlugin {
+  constructor(serverless) {
+    this.provider = serverless.getProvider('aws');
+    this.s3ClientPromise = null;
+  }
+
+  async getS3Client() {
+    this.s3ClientPromise ||= this.provider
+      .getAwsSdkV3Config()
+      .then((config) => new S3Client(config));
+
+    return this.s3ClientPromise;
+  }
+
+  async upload({ bucket, key, body }) {
+    const s3 = await this.getS3Client();
+
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: key,
+        Body: body,
+      })
+    );
+  }
+}
+
+module.exports = MyPlugin;
+```
+
+`provider.getAwsSdkV3Config(options)` returns AWS SDK v3 client configuration,
+including osls-resolved region, credentials, retry settings, and proxy,
+custom CA, or timeout configuration. The returned `credentials` value is a
+credential provider function and should be passed to AWS SDK v3 clients
+unchanged.
+
+Create separate client instances when you need different regions, profiles, or
+client options.
+
+### Configuration options
+
+Supported osls-specific options are:
+
+- `region`: override the resolved provider region for this client
+- `profile`: resolve credentials from a specific AWS profile
+
+Other AWS SDK v3 client options, such as `endpoint`, `logger`, `requestHandler`,
+`forcePathStyle`, or `useAccelerateEndpoint`, are passed through to the returned config.
+
+For example:
+
+```javascript
+const config = await this.provider.getAwsSdkV3Config({
+  region: 'us-west-2',
+  forcePathStyle: true,
+});
+const s3 = new S3Client(config);
+```
+
 ## ESM plugins
 
-If you use Node.js v12.22 or later, ESM plugins are also supported.
+ESM plugins are also supported.
 
 ```javascript
 export default class MyPlugin {

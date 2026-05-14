@@ -5,11 +5,11 @@ const sinon = require('sinon');
 const path = require('path');
 const { getTmpDirPath } = require('../../../../utils/fs');
 const runServerless = require('../../../../utils/run-serverless');
-const ServerlessError = require('../../../../../lib/serverless-error');
 const fixtures = require('../../../../fixtures/programmatic');
-
-chai.use(require('chai-as-promised'));
-chai.use(require('sinon-chai'));
+const AwsInvoke = require('../../../../../lib/plugins/aws/invoke');
+const AwsProvider = require('../../../../../lib/plugins/aws/provider');
+const Serverless = require('../../../../../lib/serverless');
+const { InvokeCommand } = require('@aws-sdk/client-lambda');
 
 const expect = chai.expect;
 
@@ -74,6 +74,39 @@ describe('test/unit/lib/plugins/aws/invoke.test.js', () => {
     });
   });
 
+  it('uses an existing Lambda client promise when invoking a remote function', async () => {
+    const serverless = new Serverless({ commands: [], options: {} });
+    const options = {
+      stage: 'dev',
+      region: 'us-east-1',
+      function: 'callback',
+      functionObj: { name: 'service-dev-callback' },
+    };
+    serverless.setProvider('aws', new AwsProvider(serverless, options));
+    const awsInvoke = new AwsInvoke(serverless, options);
+    const send = sinon.stub().resolves({});
+    const getAwsSdkV3ConfigStub = sinon
+      .stub(awsInvoke.provider, 'getAwsSdkV3Config')
+      .throws(new Error('Expected existing Lambda client to be reused'));
+    awsInvoke.lambdaClientPromise = Promise.resolve({ send });
+
+    try {
+      await awsInvoke.invoke();
+
+      expect(getAwsSdkV3ConfigStub).to.not.have.been.called;
+      expect(send).to.have.been.calledOnce;
+      expect(send.firstCall.args[0]).to.be.instanceOf(InvokeCommand);
+      expect(send.firstCall.args[0].input).to.deep.equal({
+        FunctionName: 'service-dev-callback',
+        InvocationType: 'RequestResponse',
+        LogType: 'None',
+        Payload: Buffer.from('{}'),
+      });
+    } finally {
+      getAwsSdkV3ConfigStub.restore();
+    }
+  });
+
   it('should accept no data', async () => {
     const lambdaInvokeStub = sinon.stub();
     const result = await runServerless({
@@ -97,6 +130,116 @@ describe('test/unit/lib/plugins/aws/invoke.test.js', () => {
       LogType: 'None',
       Payload: Buffer.from('{}'),
     });
+  });
+
+  it('should ignore empty payload responses', async () => {
+    await expect(
+      runServerless({
+        fixture: 'invocation',
+        command: 'invoke',
+        options: {
+          function: 'callback',
+        },
+        awsRequestStubMap: {
+          Lambda: {
+            invoke: {
+              Payload: Buffer.alloc(0),
+            },
+          },
+        },
+      })
+    ).to.eventually.be.fulfilled;
+  });
+
+  it('should decode SDK v3 Uint8Array payload responses', async () => {
+    const result = await runServerless({
+      fixture: 'invocation',
+      command: 'invoke',
+      options: {
+        function: 'callback',
+        data: '{"inputKey":"inputValue"}',
+      },
+      awsRequestStubMap: {
+        Lambda: {
+          invoke: {
+            Payload: new Uint8Array(Buffer.from(JSON.stringify({ outputKey: 'outputValue' }))),
+          },
+        },
+      },
+    });
+    const expectedCredentials = result.serverless
+      .getProvider('aws')
+      .getAwsSdkV3CredentialsProvider();
+
+    expect(result.output).to.contain('"outputKey": "outputValue"');
+    expect(result.awsSdkV3Stub.sends[0].input).to.deep.equal({
+      FunctionName: result.serverless.service.getFunction('callback').name,
+      InvocationType: 'RequestResponse',
+      LogType: 'None',
+      Payload: Buffer.from(JSON.stringify({ inputKey: 'inputValue' })),
+    });
+    expect(result.awsSdkV3Stub.sends[0].clientConfig.region).to.equal(
+      result.serverless.getProvider('aws').getRegion()
+    );
+    expect(result.awsSdkV3Stub.sends[0].clientConfig.credentials).to.equal(expectedCredentials);
+  });
+
+  it('should ignore empty SDK v3 Uint8Array payload responses', async () => {
+    await expect(
+      runServerless({
+        fixture: 'invocation',
+        command: 'invoke',
+        options: {
+          function: 'callback',
+        },
+        awsRequestStubMap: {
+          Lambda: {
+            invoke: {
+              Payload: new Uint8Array(),
+            },
+          },
+        },
+      })
+    ).to.eventually.be.fulfilled;
+  });
+
+  it('should parse plain string payload responses', async () => {
+    const result = await runServerless({
+      fixture: 'invocation',
+      command: 'invoke',
+      options: {
+        function: 'callback',
+      },
+      awsRequestStubMap: {
+        Lambda: {
+          invoke: {
+            Payload: JSON.stringify({ outputKey: 'outputValue' }),
+          },
+        },
+      },
+    });
+
+    expect(result.output).to.contain('"outputKey": "outputValue"');
+  });
+
+  it('should fail on function errors with empty SDK v3 Uint8Array payload responses', async () => {
+    await expect(
+      runServerless({
+        fixture: 'invocation',
+        command: 'invoke',
+        options: {
+          function: 'callback',
+        },
+        awsRequestStubMap: {
+          Lambda: {
+            invoke: {
+              FunctionError: 'Unhandled',
+              Payload: new Uint8Array(),
+            },
+          },
+        },
+      })
+    ).to.be.eventually.rejected.and.have.property('code', 'AWS_LAMBDA_INVOCATION_FAILED');
   });
 
   it('should support plain string data', async () => {
@@ -429,9 +572,7 @@ describe('test/unit/lib/plugins/aws/invoke.test.js', () => {
           },
         },
       })
-    )
-      .to.be.eventually.rejectedWith(ServerlessError)
-      .and.have.property('code', 'FILE_NOT_FOUND');
+    ).to.be.eventually.rejected.and.have.property('code', 'FILE_NOT_FOUND');
     expect(lambdaInvokeStub).to.have.been.callCount(0);
   });
 
@@ -458,6 +599,26 @@ describe('test/unit/lib/plugins/aws/invoke.test.js', () => {
         },
       })
     ).to.be.eventually.rejectedWith(Error, 'Invoked function failed');
+  });
+
+  it('should fail the process for failed invocations with empty payload responses', async () => {
+    await expect(
+      runServerless({
+        fixture: 'invocation',
+        command: 'invoke',
+        options: {
+          function: 'callback',
+        },
+        awsRequestStubMap: {
+          Lambda: {
+            invoke: {
+              Payload: Buffer.alloc(0),
+              FunctionError: true,
+            },
+          },
+        },
+      })
+    ).to.be.eventually.rejected.and.have.property('code', 'AWS_LAMBDA_INVOCATION_FAILED');
   });
 
   it('should resolve if path is not given', async () => {

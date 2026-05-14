@@ -6,7 +6,7 @@ disabledDeprecations: LOAD_VARIABLES_FROM_ENV_FILES
 
 provider:
   name: aws
-  runtime: nodejs18.x
+  runtime: nodejs20.x
 
 functions:
   fnService:
@@ -18,7 +18,7 @@ functions:
 
   fnGo:
     handler: bin/main
-    runtime: go1.x
+    runtime: provided.al2023
 
 layers:
   layer:

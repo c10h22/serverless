@@ -28,7 +28,7 @@ This will run both functions for a message sent to the dispatch topic.
 
 ## Using a pre-existing topic
 
-If an `arn:` is specified, the framework will give permission to the topic to invoke the function and subscribe the function to the topic.
+If an `arn:` is specified, osls will give permission to the topic to invoke the function and subscribe the function to the topic.
 
 ```yml
 functions:
@@ -158,7 +158,7 @@ functions:
 
 ## Setting a redrive policy
 
-This event definition creates an SNS topic that sends messages to a Dead Letter Queue (defined by its ARN) when the associated lambda is not available. In this example, messages that aren't delivered to the `dispatcher` Lambda (because the lambda service is down or irresponsive) will end in `myDLQ`.
+This event definition creates an SNS topic that sends messages to a Dead Letter Queue (defined by its ARN) when the associated lambda is not available. In this example, messages that aren't delivered to the `dispatcher` Lambda (because the lambda service is down or unresponsive) will end in `myDLQ`.
 
 ```yml
 functions:

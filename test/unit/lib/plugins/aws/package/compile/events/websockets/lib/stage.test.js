@@ -4,16 +4,16 @@ const chai = require('chai');
 
 const expect = chai.expect;
 const sinon = require('sinon');
-const BbPromise = require('bluebird');
-const _ = require('lodash');
-const childProcess = BbPromise.promisifyAll(require('child_process'));
+const childProcess = require('child_process');
+const { promisify } = require('util');
+const isObject = require('type/object/is');
 const AwsCompileWebsocketsEvents = require('../../../../../../../../../../lib/plugins/aws/package/compile/events/websockets/index');
 const Serverless = require('../../../../../../../../../../lib/serverless');
 const AwsProvider = require('../../../../../../../../../../lib/plugins/aws/provider');
 const { createTmpDir } = require('../../../../../../../../../utils/fs');
 const runServerless = require('../../../../../../../../../utils/run-serverless');
 
-chai.use(require('chai-as-promised'));
+if (!childProcess.execAsync) childProcess.execAsync = promisify(childProcess.exec);
 
 describe('#compileStage()', () => {
   let awsCompileWebsocketsEvents;
@@ -72,9 +72,8 @@ describe('#compileStage()', () => {
   });
 
   describe('logs', () => {
-    before(() => sinon.stub(childProcess, 'execAsync'));
-    after(() => childProcess.execAsync.restore());
     beforeEach(() => {
+      sinon.stub(childProcess, 'execAsync');
       // setting up Websocket logs
       awsCompileWebsocketsEvents.serverless.service.provider.logs = {
         websocket: true,
@@ -184,7 +183,7 @@ describe('#compileStage()', () => {
             .Resources;
 
         expect(
-          _.isObject(
+          isObject(
             resources[
               awsCompileWebsocketsEvents.provider.naming.getCustomResourceApiGatewayAccountCloudWatchRoleResourceLogicalId()
             ]

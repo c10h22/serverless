@@ -1,7 +1,5 @@
 'use strict';
 
-/* eslint-disable no-unused-expressions */
-
 const sinon = require('sinon');
 const chai = require('chai');
 const proxyquire = require('proxyquire').noCallThru();
@@ -10,8 +8,6 @@ const Serverless = require('../../../../../../../../lib/serverless');
 const runServerless = require('../../../../../../../utils/run-serverless');
 
 const { expect } = chai;
-chai.use(require('sinon-chai'));
-chai.use(require('chai-as-promised'));
 
 const serverlessConfigurationExtension = {
   functions: {
@@ -536,6 +532,30 @@ describe('AwsCompileCognitoUserPoolEvents', () => {
           },
         });
       });
+    });
+
+    it('should preserve pool names named like __proto__ when tracking existing pools', async () => {
+      awsCompileCognitoUserPoolEvents.serverless.service.functions = {
+        first: {
+          name: 'first',
+          events: [
+            {
+              cognitoUserPool: {
+                pool: '__proto__',
+                trigger: 'CustomMessage',
+                existing: true,
+              },
+            },
+          ],
+        },
+      };
+
+      await awsCompileCognitoUserPoolEvents.existingCognitoUserPools();
+
+      expect(
+        awsCompileCognitoUserPoolEvents.serverless.service.provider.compiledCloudFormationTemplate
+          .Resources.FirstCustomCognitoUserPool1.Properties.UserPoolName
+      ).to.equal('__proto__');
     });
 
     it('should support `forceDeploy` setting', async () => {

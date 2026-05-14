@@ -417,7 +417,7 @@ describe('AwsCompileSNSEvents', () => {
       ).to.equal('AWS::Lambda::Permission');
     });
 
-    it('should create two SNS topic subsriptions for ARNs with the same topic name in two regions when different topicName parameters are specified', () => {
+    it('should create two SNS topic subscriptions for ARNs with the same topic name in two regions when different topicName parameters are specified', () => {
       awsCompileSNSEvents.serverless.service.functions = {
         first: {
           events: [
@@ -454,7 +454,7 @@ describe('AwsCompileSNSEvents', () => {
       ).to.equal('AWS::SNS::Subscription');
     });
 
-    it('should override SNS topic subsription CF resource name when arn and topicName are given as object properties', () => {
+    it('should override SNS topic subscription CF resource name when arn and topicName are given as object properties', () => {
       awsCompileSNSEvents.serverless.service.functions = {
         first: {
           events: [
@@ -485,7 +485,6 @@ describe('AwsCompileSNSEvents', () => {
       ).to.equal('AWS::Lambda::Permission');
     });
 
-    // eslint-disable-next-line max-len
     it('should create SNS topic when arn object and topicName are given as object properties', () => {
       awsCompileSNSEvents.serverless.service.functions = {
         first: {
@@ -519,7 +518,6 @@ describe('AwsCompileSNSEvents', () => {
       ).to.equal('AWS::Lambda::Permission');
     });
 
-    // eslint-disable-next-line max-len
     it('should throw an error when arn object and no topicName are given as object properties', () => {
       awsCompileSNSEvents.serverless.service.functions = {
         first: {

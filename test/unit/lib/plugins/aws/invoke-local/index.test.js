@@ -1,28 +1,51 @@
 'use strict';
 
+const http = require('http');
+const fs = require('fs');
+const fsp = fs.promises;
 const chai = require('chai');
 const sinon = require('sinon');
+const os = require('os');
 const path = require('path');
+const AdmZip = require('adm-zip');
 const EventEmitter = require('events');
-const fse = require('fs-extra');
 const log = require('log').get('serverless:test');
 const proxyquire = require('proxyquire');
-const overrideEnv = require('process-utils/override-env');
+const { overrideEnv } = require('../../../../../utils/process');
 const AwsProvider = require('../../../../../../lib/plugins/aws/provider');
+const {
+  CloudFormationClient,
+  ListExportsCommand,
+  ListStackResourcesCommand,
+} = require('@aws-sdk/client-cloudformation');
 const Serverless = require('../../../../../../lib/serverless');
+const ServerlessError = require('../../../../../../lib/serverless-error');
 const CLI = require('../../../../../../lib/classes/cli');
 const { getTmpDirPath } = require('../../../../../utils/fs');
-const skipWithNotice = require('@serverless/test/skip-with-notice');
+const skipWithNotice = require('../../../../../lib/skip-with-notice');
 const runServerless = require('../../../../../utils/run-serverless');
-const spawnExt = require('child-process-ext/spawn');
+const spawnExt = require('../../../../../../lib/utils/spawn');
+const configureAwsSdkV3Stub = require('../../../../../lib/configure-aws-sdk-v3-stub');
+const releasePendingRequestsUntilSettled = require('../../../../../utils/release-pending-requests-until-settled');
 
 const tmpServicePath = __dirname;
-
-chai.use(require('chai-as-promised'));
 
 chai.should();
 
 const expect = chai.expect;
+
+const parseJsonOutput = (output) => {
+  const objectStartIndex = output.indexOf('{');
+  const arrayStartIndex = output.indexOf('[');
+  const startIndex = [objectStartIndex, arrayStartIndex]
+    .filter((index) => index !== -1)
+    .sort((left, right) => left - right)[0];
+  const objectEndIndex = output.lastIndexOf('}');
+  const arrayEndIndex = output.lastIndexOf(']');
+  const endIndex = Math.max(objectEndIndex, arrayEndIndex);
+
+  return JSON.parse(output.slice(startIndex, endIndex + 1));
+};
 
 describe('AwsInvokeLocal', () => {
   let AwsInvokeLocal;
@@ -62,20 +85,22 @@ describe('AwsInvokeLocal', () => {
 
     stdinStub = sinon.stub().resolves('');
     AwsInvokeLocal = proxyquire('../../../../../../lib/plugins/aws/invoke-local/index', {
-      'get-stdin': stdinStub,
-      'child-process-ext/spawn': spawnExtStub,
+      '../../../utils/get-stdin': stdinStub,
+      '../../../utils/spawn': spawnExtStub,
     });
     serverless = new Serverless({ commands: [], options: {} });
     serverless.serviceDir = 'servicePath';
     serverless.cli = new CLI(serverless);
     serverless.processedInput = { commands: ['invoke'] };
     provider = new AwsProvider(serverless, options);
-    provider.cachedCredentials = {
-      credentials: { accessKeyId: 'foo', secretAccessKey: 'bar' },
-    };
     serverless.setProvider('aws', provider);
     awsInvokeLocal = new AwsInvokeLocal(serverless, options);
     awsInvokeLocal.provider = provider;
+  });
+
+  afterEach(() => {
+    delete Object.prototype.polluted;
+    delete Object.prototype.adversarial;
   });
 
   describe('#extendedValidate()', () => {
@@ -232,24 +257,36 @@ describe('AwsInvokeLocal', () => {
   });
 
   describe('#getCredentialEnvVars()', () => {
-    it('returns empty object when credentials is not set', () => {
-      provider.cachedCredentials = null;
+    let credentialsProviderStub;
+    let getAwsSdkV3CredentialsProviderStub;
 
-      const credentialEnvVars = awsInvokeLocal.getCredentialEnvVars();
-
-      expect(credentialEnvVars).to.be.eql({});
+    beforeEach(() => {
+      credentialsProviderStub = sinon.stub().resolves({});
+      getAwsSdkV3CredentialsProviderStub = sinon
+        .stub(provider, 'getAwsSdkV3CredentialsProvider')
+        .returns(credentialsProviderStub);
     });
 
-    it('returns credential env vars from cached credentials', () => {
-      provider.cachedCredentials = {
-        credentials: {
-          accessKeyId: 'ID',
-          secretAccessKey: 'SECRET',
-          sessionToken: 'TOKEN',
-        },
-      };
+    afterEach(() => getAwsSdkV3CredentialsProviderStub.restore());
 
-      const credentialEnvVars = awsInvokeLocal.getCredentialEnvVars();
+    it('returns empty object when SDK v3 credentials have no env fields', async () => {
+      const credentialEnvVars = await awsInvokeLocal.getCredentialEnvVars();
+
+      expect(credentialEnvVars).to.be.eql({});
+      expect(getAwsSdkV3CredentialsProviderStub).to.have.been.calledOnce;
+      expect(credentialsProviderStub).to.have.been.calledOnceWithExactly({
+        callerClientConfig: { region: 'us-east-1' },
+      });
+    });
+
+    it('returns credential env vars from SDK v3 credentials', async () => {
+      credentialsProviderStub.resolves({
+        accessKeyId: 'ID',
+        secretAccessKey: 'SECRET',
+        sessionToken: 'TOKEN',
+      });
+
+      const credentialEnvVars = await awsInvokeLocal.getCredentialEnvVars();
 
       expect(credentialEnvVars).to.be.eql({
         AWS_ACCESS_KEY_ID: 'ID',
@@ -257,12 +294,393 @@ describe('AwsInvokeLocal', () => {
         AWS_SESSION_TOKEN: 'TOKEN',
       });
     });
+
+    it('omits undefined SDK v3 credential fields', async () => {
+      credentialsProviderStub.resolves({
+        accessKeyId: 'ID',
+        secretAccessKey: 'SECRET',
+      });
+
+      const credentialEnvVars = await awsInvokeLocal.getCredentialEnvVars();
+
+      expect(credentialEnvVars).to.be.eql({
+        AWS_ACCESS_KEY_ID: 'ID',
+        AWS_SECRET_ACCESS_KEY: 'SECRET',
+      });
+    });
+
+    it('returns empty object for missing default-chain credentials', async () => {
+      credentialsProviderStub.rejects(
+        new ServerlessError('AWS provider credentials not found.', 'AWS_CREDENTIALS_NOT_FOUND')
+      );
+
+      const credentialEnvVars = await awsInvokeLocal.getCredentialEnvVars();
+
+      expect(credentialEnvVars).to.be.eql({});
+    });
+
+    it('surfaces configured credential provider failures', async () => {
+      const credentialsError = Object.assign(new Error('The SSO session has expired'), {
+        name: 'CredentialsProviderError',
+      });
+      credentialsProviderStub.rejects(credentialsError);
+
+      await expect(awsInvokeLocal.getCredentialEnvVars()).to.be.rejectedWith(
+        'The SSO session has expired'
+      );
+    });
+  });
+
+  describe('#getConfiguredEnvVars()', () => {
+    it('merges provider and function env vars with function precedence and null filtering', () => {
+      const providerValue = { Ref: 'providerValue' };
+      const functionValue = { 'Fn::ImportValue': 'functionValue' };
+
+      serverless.service.provider.environment = {
+        SHARED: providerValue,
+        DROP_ME: null,
+      };
+      awsInvokeLocal.options.functionObj = {
+        environment: {
+          SHARED: functionValue,
+          KEEP_ME: 'yes',
+        },
+      };
+
+      const result = awsInvokeLocal.getConfiguredEnvVars();
+
+      expect(result).to.deep.equal({
+        SHARED: functionValue,
+        KEEP_ME: 'yes',
+      });
+      expect(serverless.service.provider.environment.SHARED).to.equal(providerValue);
+    });
+
+    it('does not drop or pollute when provider env contains an own __proto__ key', () => {
+      const providerEnv = JSON.parse('{"__proto__":{"polluted":"yes"},"REGULAR":"value"}');
+      serverless.service.provider.environment = providerEnv;
+      awsInvokeLocal.options.functionObj = { environment: {} };
+
+      const result = awsInvokeLocal.getConfiguredEnvVars();
+
+      expect(result.REGULAR).to.equal('value');
+      expect(Object.prototype.hasOwnProperty.call(result, '__proto__')).to.equal(true);
+      expect({}.polluted).to.equal(undefined);
+    });
+
+    it('preserves function env values including __proto__ without silent drops', () => {
+      const functionEnv = JSON.parse('{"__proto__":"value","NORMAL":"yes"}');
+      serverless.service.provider.environment = {};
+      awsInvokeLocal.options.functionObj = { environment: functionEnv };
+
+      const result = awsInvokeLocal.getConfiguredEnvVars();
+
+      expect(result.NORMAL).to.equal('yes');
+      expect(Reflect.get(result, '__proto__')).to.equal('value');
+      expect(Object.prototype.hasOwnProperty.call(result, '__proto__')).to.equal(true);
+      expect({}.polluted).to.equal(undefined);
+    });
+  });
+
+  describe('#resolveConfiguredEnvVars()', () => {
+    afterEach(() => {
+      if (CloudFormationClient.prototype.send.restore) {
+        CloudFormationClient.prototype.send.restore();
+      }
+    });
+
+    it('resolves Fn::ImportValue env vars', async () => {
+      const listExportsStub = sinon.stub(CloudFormationClient.prototype, 'send').resolves({
+        Exports: [{ Name: 'some-export', Value: 'imported-value' }],
+      });
+
+      const result = await awsInvokeLocal.resolveConfiguredEnvVars({
+        IMPORTED: {
+          'Fn::ImportValue': 'some-export',
+        },
+      });
+
+      expect(result).to.deep.equal({
+        IMPORTED: 'imported-value',
+      });
+      expect(listExportsStub).to.have.been.calledOnce;
+      expect(listExportsStub.firstCall.args[0]).to.be.instanceOf(ListExportsCommand);
+      expect(listExportsStub.firstCall.args[0].input).to.deep.equal({});
+    });
+
+    it('follows Fn::ImportValue pagination', async () => {
+      const listExportsStub = sinon
+        .stub(CloudFormationClient.prototype, 'send')
+        .onFirstCall()
+        .resolves({ Exports: [{ Name: 'other-export', Value: 'other-value' }], NextToken: 'next' })
+        .onSecondCall()
+        .resolves({ Exports: [{ Name: 'some-export', Value: 'imported-value' }] });
+
+      const result = await awsInvokeLocal.resolveConfiguredEnvVars({
+        IMPORTED: {
+          'Fn::ImportValue': 'some-export',
+        },
+      });
+
+      expect(result).to.deep.equal({ IMPORTED: 'imported-value' });
+      expect(listExportsStub).to.have.been.calledTwice;
+      expect(listExportsStub.secondCall.args[0]).to.be.instanceOf(ListExportsCommand);
+      expect(listExportsStub.secondCall.args[0].input).to.deep.equal({ NextToken: 'next' });
+    });
+
+    it('tolerates Fn::ImportValue pages without Exports', async () => {
+      const listExportsStub = sinon
+        .stub(CloudFormationClient.prototype, 'send')
+        .onFirstCall()
+        .resolves({ NextToken: 'next' })
+        .onSecondCall()
+        .resolves({ Exports: [{ Name: 'some-export', Value: 'imported-value' }] });
+
+      const result = await awsInvokeLocal.resolveConfiguredEnvVars({
+        IMPORTED: {
+          'Fn::ImportValue': 'some-export',
+        },
+      });
+
+      expect(result).to.deep.equal({ IMPORTED: 'imported-value' });
+      expect(listExportsStub).to.have.been.calledTwice;
+    });
+
+    it('rejects missing Fn::ImportValue env vars', async () => {
+      sinon
+        .stub(CloudFormationClient.prototype, 'send')
+        .resolves({ Exports: [{ Name: 'other-export', Value: 'other-value' }] });
+
+      await expect(
+        awsInvokeLocal.resolveConfiguredEnvVars({
+          IMPORTED: {
+            'Fn::ImportValue': 'missing-export',
+          },
+        })
+      ).to.be.rejected.then((error) => {
+        expect(error.code).to.equal('INVOKE_LOCAL_INVALID_ENV_VARIABLE');
+        expect(error.message).to.include(
+          'Could not resolve Fn::ImportValue with name missing-export'
+        );
+      });
+    });
+
+    it('resolves Ref env vars', async () => {
+      const listStackResourcesStub = sinon.stub(CloudFormationClient.prototype, 'send').resolves({
+        StackResourceSummaries: [
+          {
+            LogicalResourceId: 'SomeResource',
+            PhysicalResourceId: 'physical-resource-id',
+          },
+        ],
+      });
+
+      const result = await awsInvokeLocal.resolveConfiguredEnvVars({
+        TARGET: {
+          Ref: 'SomeResource',
+        },
+      });
+
+      expect(result).to.deep.equal({
+        TARGET: 'physical-resource-id',
+      });
+      expect(listStackResourcesStub).to.have.been.calledOnce;
+      expect(listStackResourcesStub.firstCall.args[0]).to.be.instanceOf(ListStackResourcesCommand);
+      expect(listStackResourcesStub.firstCall.args[0].input).to.deep.equal({
+        StackName: provider.naming.getStackName(),
+      });
+    });
+
+    it('follows Ref pagination', async () => {
+      const listStackResourcesStub = sinon
+        .stub(CloudFormationClient.prototype, 'send')
+        .onFirstCall()
+        .resolves({
+          StackResourceSummaries: [{ LogicalResourceId: 'OtherResource' }],
+          NextToken: 'next-page',
+        })
+        .onSecondCall()
+        .resolves({
+          StackResourceSummaries: [
+            {
+              LogicalResourceId: 'SomeResource',
+              PhysicalResourceId: 'physical-resource-id',
+            },
+          ],
+        });
+
+      const result = await awsInvokeLocal.resolveConfiguredEnvVars({
+        TARGET: {
+          Ref: 'SomeResource',
+        },
+      });
+
+      expect(result).to.deep.equal({ TARGET: 'physical-resource-id' });
+      expect(listStackResourcesStub).to.have.been.calledTwice;
+      expect(listStackResourcesStub.secondCall.args[0]).to.be.instanceOf(ListStackResourcesCommand);
+      expect(listStackResourcesStub.secondCall.args[0].input).to.deep.equal({
+        StackName: provider.naming.getStackName(),
+        NextToken: 'next-page',
+      });
+    });
+
+    it('stops Ref pagination when a match is found on the first page', async () => {
+      const listStackResourcesStub = sinon.stub(CloudFormationClient.prototype, 'send').resolves({
+        StackResourceSummaries: [
+          {
+            LogicalResourceId: 'SomeResource',
+            PhysicalResourceId: 'physical-resource-id',
+          },
+        ],
+        NextToken: 'next-page',
+      });
+
+      const result = await awsInvokeLocal.resolveConfiguredEnvVars({
+        TARGET: {
+          Ref: 'SomeResource',
+        },
+      });
+
+      expect(result).to.deep.equal({ TARGET: 'physical-resource-id' });
+      expect(listStackResourcesStub).to.have.been.calledOnce;
+    });
+
+    it('rejects missing Ref env vars', async () => {
+      sinon
+        .stub(CloudFormationClient.prototype, 'send')
+        .onFirstCall()
+        .resolves({
+          StackResourceSummaries: [{ LogicalResourceId: 'OtherResource' }],
+          NextToken: 'next-page',
+        })
+        .onSecondCall()
+        .resolves({ StackResourceSummaries: [{ LogicalResourceId: 'AnotherResource' }] });
+
+      await expect(
+        awsInvokeLocal.resolveConfiguredEnvVars({
+          TARGET: {
+            Ref: 'SomeResource',
+          },
+        })
+      ).to.be.rejected.then((error) => {
+        expect(error.code).to.equal('INVOKE_LOCAL_INVALID_ENV_VARIABLE');
+        expect(error.message).to.include('Could not resolve Ref with name SomeResource');
+      });
+    });
+
+    it('reuses one CloudFormation client across env var resolutions', async () => {
+      const getAwsSdkV3ConfigSpy = sinon.spy(provider, 'getAwsSdkV3Config');
+      const sendStub = sinon
+        .stub(CloudFormationClient.prototype, 'send')
+        .callsFake(async (command) => {
+          if (command instanceof ListExportsCommand) {
+            return { Exports: [{ Name: 'some-export', Value: 'imported-value' }] };
+          }
+          if (command instanceof ListStackResourcesCommand) {
+            return {
+              StackResourceSummaries: [
+                {
+                  LogicalResourceId: 'SomeResource',
+                  PhysicalResourceId: 'physical-resource-id',
+                },
+              ],
+            };
+          }
+          throw new Error(`Unexpected CloudFormation command ${command.constructor.name}`);
+        });
+
+      try {
+        const result = await awsInvokeLocal.resolveConfiguredEnvVars({
+          IMPORTED: {
+            'Fn::ImportValue': 'some-export',
+          },
+          TARGET: {
+            Ref: 'SomeResource',
+          },
+        });
+
+        expect(result).to.deep.equal({
+          IMPORTED: 'imported-value',
+          TARGET: 'physical-resource-id',
+        });
+        expect(getAwsSdkV3ConfigSpy).to.have.been.calledOnce;
+        expect(sendStub).to.have.been.calledTwice;
+        expect(sendStub.secondCall.thisValue).to.equal(sendStub.firstCall.thisValue);
+      } finally {
+        getAwsSdkV3ConfigSpy.restore();
+      }
+    });
+
+    it('passes credential provider unchanged to the CloudFormation client constructor', async () => {
+      const credentials = async () => ({ accessKeyId: 'key', secretAccessKey: 'secret' });
+      const clientConfigs = [];
+      const commands = [];
+      class StubCloudFormationClient {
+        constructor(config) {
+          clientConfigs.push(config);
+        }
+
+        async send(command) {
+          commands.push(command);
+          return { Exports: [{ Name: 'some-export', Value: 'imported-value' }] };
+        }
+      }
+      const AwsInvokeLocalWithStub = proxyquire(
+        '../../../../../../lib/plugins/aws/invoke-local/index',
+        {
+          '../../../utils/get-stdin': stdinStub,
+          '../../../utils/spawn': spawnExtStub,
+          '@aws-sdk/client-cloudformation': {
+            CloudFormationClient: StubCloudFormationClient,
+            ListExportsCommand,
+            ListStackResourcesCommand,
+          },
+        }
+      );
+      const invokeLocal = new AwsInvokeLocalWithStub(serverless, options);
+      invokeLocal.provider = {
+        ...provider,
+        getAwsSdkV3Config: sinon.stub().resolves({ region: 'us-west-2', credentials }),
+      };
+
+      const result = await invokeLocal.resolveConfiguredEnvVars({
+        IMPORTED: {
+          'Fn::ImportValue': 'some-export',
+        },
+      });
+
+      expect(result).to.deep.equal({ IMPORTED: 'imported-value' });
+      expect(clientConfigs).to.have.length(1);
+      expect(clientConfigs[0].region).to.equal('us-west-2');
+      expect(clientConfigs[0].credentials).to.equal(credentials);
+      expect(commands).to.have.length(1);
+      expect(commands[0]).to.be.instanceOf(ListExportsCommand);
+    });
+
+    it('rejects unsupported environment variable objects', async () => {
+      return expect(
+        awsInvokeLocal.resolveConfiguredEnvVars({
+          TARGET: {
+            Unsupported: true,
+          },
+        })
+      ).to.be.rejected.then((error) => {
+        expect(error.code).to.equal('INVOKE_LOCAL_INVALID_ENV_VARIABLE');
+      });
+    });
   });
 
   describe('#loadEnvVars()', () => {
+    let credentialsProviderStub;
+    let getAwsSdkV3CredentialsProviderStub;
     let restoreEnv;
+
     beforeEach(() => {
       ({ restoreEnv } = overrideEnv());
+      credentialsProviderStub = sinon.stub().resolves({});
+      getAwsSdkV3CredentialsProviderStub = sinon
+        .stub(provider, 'getAwsSdkV3CredentialsProvider')
+        .returns(credentialsProviderStub);
       serverless.serviceDir = true;
       serverless.service.provider = {
         environment: {
@@ -281,7 +699,10 @@ describe('AwsInvokeLocal', () => {
       };
     });
 
-    afterEach(() => restoreEnv());
+    afterEach(() => {
+      restoreEnv();
+      getAwsSdkV3CredentialsProviderStub.restore();
+    });
 
     it('it should load provider env vars', async () => {
       await awsInvokeLocal.loadEnvVars();
@@ -303,7 +724,7 @@ describe('AwsInvokeLocal', () => {
       await awsInvokeLocal.loadEnvVars();
       expect(process.env.LANG).to.equal('en_US.UTF-8');
       expect(process.env.LD_LIBRARY_PATH).to.equal(
-        '/usr/local/lib64/node-v4.3.x/lib:/lib64:/usr/lib64:/var/runtime:/var/runtime/lib:/var/task:/var/task/lib'
+        '/var/lang/lib:/lib64:/usr/lib64:/var/runtime:/var/runtime/lib:/var/task:/var/task/lib'
       );
       expect(process.env.LAMBDA_TASK_ROOT).to.equal('/var/task');
       expect(process.env.LAMBDA_RUNTIME_DIR).to.equal('/var/runtime');
@@ -320,12 +741,10 @@ describe('AwsInvokeLocal', () => {
     });
 
     it('it should set credential env vars #1', async () => {
-      provider.cachedCredentials = {
-        credentials: {
-          accessKeyId: 'ID',
-          secretAccessKey: 'SECRET',
-        },
-      };
+      credentialsProviderStub.resolves({
+        accessKeyId: 'ID',
+        secretAccessKey: 'SECRET',
+      });
 
       await awsInvokeLocal.loadEnvVars();
       expect(process.env.AWS_ACCESS_KEY_ID).to.equal('ID');
@@ -334,11 +753,9 @@ describe('AwsInvokeLocal', () => {
     });
 
     it('it should set credential env vars #2', async () => {
-      provider.cachedCredentials = {
-        credentials: {
-          sessionToken: 'TOKEN',
-        },
-      };
+      credentialsProviderStub.resolves({
+        sessionToken: 'TOKEN',
+      });
       await awsInvokeLocal.loadEnvVars();
 
       expect(process.env.AWS_SESSION_TOKEN).to.equal('TOKEN');
@@ -346,13 +763,46 @@ describe('AwsInvokeLocal', () => {
       expect('AWS_SECRET_ACCESS_KEY' in process.env).to.equal(false);
     });
 
-    it('it should work without cached credentials set', async () => {
-      provider.cachedCredentials = null;
+    it('it should work without credentials set', async () => {
+      credentialsProviderStub.rejects(
+        new ServerlessError('AWS provider credentials not found.', 'AWS_CREDENTIALS_NOT_FOUND')
+      );
+
       await awsInvokeLocal.loadEnvVars();
 
       expect('AWS_SESSION_TOKEN' in process.env).to.equal(false);
       expect('AWS_ACCESS_KEY_ID' in process.env).to.equal(false);
       expect('AWS_SECRET_ACCESS_KEY' in process.env).to.equal(false);
+    });
+
+    it('loads credential env vars from SDK v3 credentials', async () => {
+      credentialsProviderStub.resolves({
+        accessKeyId: 'ID',
+        secretAccessKey: 'SECRET',
+        sessionToken: 'TOKEN',
+      });
+
+      await awsInvokeLocal.loadEnvVars();
+
+      expect(process.env.AWS_ACCESS_KEY_ID).to.equal('ID');
+      expect(process.env.AWS_SECRET_ACCESS_KEY).to.equal('SECRET');
+      expect(process.env.AWS_SESSION_TOKEN).to.equal('TOKEN');
+    });
+
+    it('preserves configured env var precedence over SDK v3 credentials', async () => {
+      credentialsProviderStub.resolves({
+        accessKeyId: 'ID',
+        secretAccessKey: 'SECRET',
+        sessionToken: 'TOKEN',
+      });
+      serverless.service.provider.environment.AWS_ACCESS_KEY_ID = 'CONFIGURED_ID';
+      awsInvokeLocal.options.functionObj.environment.AWS_SECRET_ACCESS_KEY = 'CONFIGURED_SECRET';
+
+      await awsInvokeLocal.loadEnvVars();
+
+      expect(process.env.AWS_ACCESS_KEY_ID).to.equal('CONFIGURED_ID');
+      expect(process.env.AWS_SECRET_ACCESS_KEY).to.equal('CONFIGURED_SECRET');
+      expect(process.env.AWS_SESSION_TOKEN).to.equal('TOKEN');
     });
 
     it('should fallback to service provider configuration when options are not available', async () => {
@@ -369,6 +819,100 @@ describe('AwsInvokeLocal', () => {
 
       await awsInvokeLocal.loadEnvVars();
       expect(process.env.providerVar).to.be.equal('providerValueOverwritten');
+    });
+
+    it('loads unsafe env names onto process.env without prototype pollution', async () => {
+      const originalProcessEnvPrototype = Object.getPrototypeOf(process.env);
+      const originalConstructor = Object.prototype.constructor;
+
+      serverless.service.provider.environment = JSON.parse(
+        '{"__proto__":"proto-value","constructor":"ctor-value","prototype":"prototype-value"}'
+      );
+      awsInvokeLocal.options.functionObj.environment = {};
+
+      await awsInvokeLocal.loadEnvVars();
+
+      expect(Object.getPrototypeOf(process.env)).to.equal(originalProcessEnvPrototype);
+      expect(Object.prototype.hasOwnProperty.call(process.env, '__proto__')).to.equal(true);
+      expect(Object.prototype.hasOwnProperty.call(process.env, 'constructor')).to.equal(true);
+      expect(Object.prototype.hasOwnProperty.call(process.env, 'prototype')).to.equal(true);
+      expect(Reflect.get(process.env, '__proto__')).to.equal('proto-value');
+      expect(process.env.constructor).to.equal('ctor-value');
+      expect(process.env.prototype).to.equal('prototype-value');
+      expect(Object.keys(process.env)).to.include.members([
+        '__proto__',
+        'constructor',
+        'prototype',
+      ]);
+      expect(Object.prototype.constructor).to.equal(originalConstructor);
+      expect({}.polluted).to.equal(undefined);
+    });
+  });
+
+  describe('#ensurePackage()', () => {
+    let accessStub;
+    let pluginSpawnStub;
+
+    beforeEach(() => {
+      accessStub = sinon.stub(fsp, 'access');
+      pluginSpawnStub = sinon.stub(serverless.pluginManager, 'spawn').resolves();
+      serverless.serviceDir = getTmpDirPath();
+    });
+
+    afterEach(() => {
+      fsp.access.restore();
+      serverless.pluginManager.spawn.restore();
+    });
+
+    it('skips packaging when skip-package is set and the state file exists', async () => {
+      awsInvokeLocal.options['skip-package'] = true;
+      accessStub.resolves();
+
+      await awsInvokeLocal.ensurePackage();
+
+      expect(accessStub).to.have.been.calledOnce;
+      expect(pluginSpawnStub).to.not.have.been.called;
+    });
+
+    it('packages when skip-package is set but the state file is missing', async () => {
+      awsInvokeLocal.options['skip-package'] = true;
+      accessStub.rejects(Object.assign(new Error('missing'), { code: 'ENOENT' }));
+
+      await awsInvokeLocal.ensurePackage();
+
+      expect(pluginSpawnStub).to.have.been.calledOnceWithExactly('package');
+    });
+  });
+
+  describe('#extractArtifact()', () => {
+    let chmodStub;
+
+    beforeEach(() => {
+      chmodStub = sinon.stub(fsp, 'chmod').resolves();
+      serverless.serviceDir = getTmpDirPath();
+      awsInvokeLocal.options.functionObj = {};
+      serverless.service.package = {};
+    });
+
+    afterEach(() => {
+      fsp.chmod.restore();
+    });
+
+    it('filters directory placeholders and chmods bootstrap to 755', async () => {
+      const artifactPath = path.join(serverless.serviceDir, 'artifact.zip');
+      const zip = new AdmZip();
+
+      zip.addFile('bootstrap', Buffer.from('#!/bin/sh\n'));
+      zip.addFile('nested/', Buffer.alloc(0));
+      zip.writeZip(artifactPath);
+
+      awsInvokeLocal.options.functionObj.package = {
+        artifact: artifactPath,
+      };
+
+      const destination = await awsInvokeLocal.extractArtifact();
+
+      expect(chmodStub).to.have.been.calledWith(path.join(destination, 'bootstrap'), '755');
     });
   });
 
@@ -421,7 +965,7 @@ describe('AwsInvokeLocal', () => {
         it(`should call invokeLocalNodeJs for any node.js runtime version for ${item.path}`, async () => {
           awsInvokeLocal.options.functionObj.handler = item.path;
 
-          awsInvokeLocal.options.functionObj.runtime = 'nodejs18.x';
+          awsInvokeLocal.options.functionObj.runtime = 'nodejs20.x';
           await awsInvokeLocal.invokeLocal();
           expect(invokeLocalNodeJsStub.calledOnce).to.be.equal(true);
           expect(
@@ -437,17 +981,6 @@ describe('AwsInvokeLocal', () => {
       expect(invokeLocalNodeJsStub.calledOnce).to.be.equal(true);
       expect(
         invokeLocalNodeJsStub.calledWithExactly('handler', 'hello', {}, 'custom context')
-      ).to.be.equal(true);
-    });
-
-    it('should call invokeLocalPython when python3.9 runtime is set', async () => {
-      awsInvokeLocal.options.functionObj.runtime = 'python3.9';
-      await awsInvokeLocal.invokeLocal();
-      // NOTE: this is important so that tests on Windows won't fail
-      const runtime = process.platform === 'win32' ? 'python.exe' : 'python3.9';
-      expect(invokeLocalPythonStub.calledOnce).to.be.equal(true);
-      expect(
-        invokeLocalPythonStub.calledWithExactly(runtime, 'handler', 'hello', {}, undefined)
       ).to.be.equal(true);
     });
 
@@ -506,41 +1039,38 @@ describe('AwsInvokeLocal', () => {
       ).to.be.equal(true);
     });
 
-    it('should call invokeLocalJava when java8 runtime is set', async () => {
-      awsInvokeLocal.options.functionObj.runtime = 'java8';
+    ['java8.al2', 'java11', 'java17', 'java21', 'java25'].forEach((runtime) => {
+      it(`should call invokeLocalJava when ${runtime} runtime is set`, async () => {
+        awsInvokeLocal.options.functionObj.runtime = runtime;
+        await awsInvokeLocal.invokeLocal();
+        expect(invokeLocalJavaStub.calledOnce).to.be.equal(true);
+        expect(
+          invokeLocalJavaStub.calledWithExactly(
+            'java',
+            'handler.hello',
+            'handleRequest',
+            undefined,
+            {},
+            undefined
+          )
+        ).to.be.equal(true);
+      });
+    });
+
+    it('should call invokeLocalJava with an explicit handler method', async () => {
+      awsInvokeLocal.options.functionObj.runtime = 'java21';
+      awsInvokeLocal.options.functionObj.handler = 'com.example.Handler::customMethod';
       await awsInvokeLocal.invokeLocal();
       expect(invokeLocalJavaStub.calledOnce).to.be.equal(true);
       expect(
         invokeLocalJavaStub.calledWithExactly(
           'java',
-          'handler.hello',
-          'handleRequest',
+          'com.example.Handler',
+          'customMethod',
           undefined,
           {},
           undefined
         )
-      ).to.be.equal(true);
-    });
-
-    it('should call invokeLocalRuby when ruby2.7 runtime is set', async () => {
-      awsInvokeLocal.options.functionObj.runtime = 'ruby2.7';
-      await awsInvokeLocal.invokeLocal();
-      // NOTE: this is important so that tests on Windows won't fail
-      const runtime = process.platform === 'win32' ? 'ruby.exe' : 'ruby';
-      expect(invokeLocalRubyStub.calledOnce).to.be.equal(true);
-      expect(
-        invokeLocalRubyStub.calledWithExactly(runtime, 'handler', 'hello', {}, undefined)
-      ).to.be.equal(true);
-    });
-
-    it('should call invokeLocalRuby when ruby3.2 runtime is set', async () => {
-      awsInvokeLocal.options.functionObj.runtime = 'ruby3.2';
-      await awsInvokeLocal.invokeLocal();
-      // NOTE: this is important so that tests on Windows won't fail
-      const runtime = process.platform === 'win32' ? 'ruby.exe' : 'ruby';
-      expect(invokeLocalRubyStub.calledOnce).to.be.equal(true);
-      expect(
-        invokeLocalRubyStub.calledWithExactly(runtime, 'handler', 'hello', {}, undefined)
       ).to.be.equal(true);
     });
 
@@ -566,16 +1096,27 @@ describe('AwsInvokeLocal', () => {
       ).to.be.equal(true);
     });
 
-    it('should call invokeLocalDocker if using runtime provided', async () => {
-      awsInvokeLocal.options.functionObj.runtime = 'provided';
+    it('should call invokeLocalRuby when ruby4.0 runtime is set', async () => {
+      awsInvokeLocal.options.functionObj.runtime = 'ruby4.0';
+      await awsInvokeLocal.invokeLocal();
+      // NOTE: this is important so that tests on Windows won't fail
+      const runtime = process.platform === 'win32' ? 'ruby.exe' : 'ruby';
+      expect(invokeLocalRubyStub.calledOnce).to.be.equal(true);
+      expect(
+        invokeLocalRubyStub.calledWithExactly(runtime, 'handler', 'hello', {}, undefined)
+      ).to.be.equal(true);
+    });
+
+    it('should call invokeLocalDocker if using runtime provided.al2023', async () => {
+      awsInvokeLocal.options.functionObj.runtime = 'provided.al2023';
       awsInvokeLocal.options.functionObj.handler = 'handler.foobar';
       await awsInvokeLocal.invokeLocal();
       expect(invokeLocalDockerStub.calledOnce).to.be.equal(true);
       expect(invokeLocalDockerStub.calledWithExactly()).to.be.equal(true);
     });
 
-    it('should call invokeLocalDocker if using --docker option with nodejs18.x', async () => {
-      awsInvokeLocal.options.functionObj.runtime = 'nodejs18.x';
+    it('should call invokeLocalDocker if using --docker option with nodejs20.x', async () => {
+      awsInvokeLocal.options.functionObj.runtime = 'nodejs20.x';
       awsInvokeLocal.options.functionObj.handler = 'handler.foobar';
       awsInvokeLocal.options.docker = true;
       await awsInvokeLocal.invokeLocal();
@@ -588,8 +1129,8 @@ describe('AwsInvokeLocal', () => {
     let invokeLocalSpawnStubbed;
     beforeEach(() => {
       AwsInvokeLocal = proxyquire('../../../../../../lib/plugins/aws/invoke-local/index', {
-        'get-stdin': stdinStub,
-        'child-process-ext/spawn': spawnExtStub,
+        '../../../utils/get-stdin': stdinStub,
+        '../../../utils/spawn': spawnExtStub,
         'child_process': {
           spawn: spawnStub,
         },
@@ -627,7 +1168,7 @@ describe('AwsInvokeLocal', () => {
       const wrapperPath = await awsInvokeLocal.resolveRuntimeWrapperPath('java/target');
 
       bridgePath = wrapperPath;
-      fse.mkdirsSync(bridgePath);
+      fs.mkdirSync(bridgePath, { recursive: true });
       callJavaBridgeStub = sinon.stub(awsInvokeLocal, 'callJavaBridge').resolves();
       awsInvokeLocal.provider.options.stage = 'dev';
       awsInvokeLocal.options = {
@@ -643,7 +1184,7 @@ describe('AwsInvokeLocal', () => {
 
     afterEach(() => {
       awsInvokeLocal.callJavaBridge.restore();
-      fse.removeSync(bridgePath);
+      fs.rmSync(bridgePath, { recursive: true, force: true });
     });
 
     it('should invoke callJavaBridge when bridge is built', async () => {
@@ -676,6 +1217,9 @@ describe('AwsInvokeLocal', () => {
 
     describe('when attempting to build the Java bridge', () => {
       it("if it's not present yet", async () => {
+        fs.rmSync(bridgePath, { recursive: true, force: true });
+        spawnExtStub.resetHistory();
+
         await awsInvokeLocal.invokeLocalJava(
           'java',
           'com.serverless.Handler',
@@ -701,6 +1245,41 @@ describe('AwsInvokeLocal', () => {
             })
           )
         ).to.be.equal(true);
+        expect(spawnExtStub.calledOnce).to.be.equal(true);
+        expect(spawnExtStub.firstCall.args).to.deep.equal([
+          'mvn',
+          ['package', '-f', path.join(path.dirname(bridgePath), 'pom.xml')],
+          { shouldCloseStdin: true },
+        ]);
+      });
+
+      it('rejects if the Java bridge build fails', async () => {
+        fs.rmSync(bridgePath, { recursive: true, force: true });
+        spawnExtStub.rejects(
+          Object.assign(new Error('mvn failed'), {
+            code: 1,
+            signal: null,
+            stdoutBuffer: Buffer.from('build failed'),
+          })
+        );
+
+        await expect(
+          awsInvokeLocal.invokeLocalJava(
+            'java',
+            'com.serverless.Handler',
+            'handleRequest',
+            tmpServicePath,
+            {}
+          )
+        ).to.be.eventually.rejected.and.have.property('code', 'JAVA_BRIDGE_BUILD_FAILED');
+
+        expect(callJavaBridgeStub).to.not.have.been.called;
+        expect(spawnExtStub.calledOnce).to.be.equal(true);
+        expect(spawnExtStub.firstCall.args).to.deep.equal([
+          'mvn',
+          ['package', '-f', path.join(path.dirname(bridgePath), 'pom.xml')],
+          { shouldCloseStdin: true },
+        ]);
       });
     });
   });
@@ -708,6 +1287,7 @@ describe('AwsInvokeLocal', () => {
   describe('#invokeLocalDocker()', () => {
     let pluginMangerSpawnStub;
     let pluginMangerSpawnPackageStub;
+    let getAwsSdkV3CredentialsProviderStub;
     beforeEach(() => {
       awsInvokeLocal.provider.options.stage = 'dev';
       awsInvokeLocal.options = {
@@ -717,7 +1297,7 @@ describe('AwsInvokeLocal', () => {
           handler: 'handler.hello',
           name: 'hello',
           timeout: 4,
-          runtime: 'nodejs18.x',
+          runtime: 'nodejs20.x',
           environment: {
             functionVar: 'functionValue',
           },
@@ -731,11 +1311,20 @@ describe('AwsInvokeLocal', () => {
       };
       pluginMangerSpawnStub = sinon.stub(serverless.pluginManager, 'spawn');
       pluginMangerSpawnPackageStub = pluginMangerSpawnStub.withArgs('package').resolves();
+      getAwsSdkV3CredentialsProviderStub = sinon
+        .stub(provider, 'getAwsSdkV3CredentialsProvider')
+        .returns(
+          sinon.stub().resolves({
+            accessKeyId: 'foo',
+            secretAccessKey: 'bar',
+          })
+        );
     });
 
     afterEach(() => {
+      getAwsSdkV3CredentialsProviderStub.restore();
       serverless.pluginManager.spawn.restore();
-      fse.removeSync('.serverless');
+      fs.rmSync('.serverless', { recursive: true, force: true });
     });
 
     it('calls docker with packaged artifact', async () => {
@@ -745,7 +1334,7 @@ describe('AwsInvokeLocal', () => {
       expect(spawnExtStub.getCall(0).args).to.deep.equal(['docker', ['version']]);
       expect(spawnExtStub.getCall(1).args).to.deep.equal([
         'docker',
-        ['images', '-q', 'lambci/lambda:nodejs18.x'],
+        ['images', '-q', 'lambci/lambda:nodejs20.x'],
       ]);
       expect(spawnExtStub.getCall(3).args).to.deep.equal([
         'docker',
@@ -776,11 +1365,459 @@ describe('AwsInvokeLocal', () => {
           'commandLineEnvVar=commandLineEnvVarValue',
           '-p',
           '9292:9292',
-          'sls-docker-nodejs18.x',
+          'sls-docker-nodejs20.x',
           'handler.hello',
           '{}',
         ],
       ]);
+    });
+  });
+
+  describe('#getLayerPaths()', () => {
+    const createRemoteLayerTestContext = ({
+      awsSdkV3Stub,
+      cacheDirPath,
+      copyStub,
+      dirExistsStub,
+      downloadStub,
+      ensureDirStub,
+    }) => {
+      const ProxyquiredAwsInvokeLocal = proxyquire
+        .noCallThru()
+        .load('../../../../../../lib/plugins/aws/invoke-local/index', {
+          ...awsSdkV3Stub.modulesCacheStub,
+          '../../../utils/get-stdin': sinon.stub().resolves(''),
+          '../../../utils/spawn': sinon.stub().resolves({ stdoutBuffer: Buffer.from('Mocked') }),
+          'fs': {
+            promises: {
+              mkdir: ensureDirStub,
+            },
+          },
+          '../../../utils/fs/copy': copyStub,
+          'cachedir': sinon.stub().returns(cacheDirPath),
+          '../../../utils/fs/dir-exists': dirExistsStub,
+          '../../../utils/serverless-utils/download': downloadStub,
+        });
+      const localOptions = {
+        stage: 'dev',
+        region: 'us-east-1',
+        function: 'first',
+      };
+      const localServerless = new Serverless({ commands: [], options: {} });
+      localServerless.serviceDir = 'servicePath';
+      localServerless.cli = new CLI(localServerless);
+      localServerless.processedInput = { commands: ['invoke'] };
+      localServerless.service.layers = {};
+
+      const localProvider = new AwsProvider(localServerless, localOptions);
+      localServerless.setProvider('aws', localProvider);
+      const invokeLocal = new ProxyquiredAwsInvokeLocal(localServerless, localOptions);
+      invokeLocal.provider = localProvider;
+
+      return { invokeLocal, localServerless };
+    };
+
+    it('downloads remote layers from the provider content location', async () => {
+      const cacheDirPath = path.join(os.tmpdir(), 'serverless-cache');
+      const downloadStub = sinon.stub().resolves();
+      const dirExistsStub = sinon.stub().resolves(false);
+      const ensureDirStub = sinon.stub().resolves();
+      const copyStub = sinon.stub().resolves();
+      const spawnExtLocalStub = sinon.stub().resolves({
+        stdoutBuffer: Buffer.from('Mocked output'),
+      });
+      const awsSdkV3Stub = configureAwsSdkV3Stub({
+        Lambda: {
+          getLayerVersion: {
+            Content: {
+              Location: 'https://layers.example.test/download?Signature=opaque',
+            },
+          },
+        },
+      });
+
+      const ProxyquiredAwsInvokeLocal = proxyquire
+        .noCallThru()
+        .load('../../../../../../lib/plugins/aws/invoke-local/index', {
+          ...awsSdkV3Stub.modulesCacheStub,
+          '../../../utils/get-stdin': sinon.stub().resolves(''),
+          '../../../utils/spawn': spawnExtLocalStub,
+          'fs': {
+            promises: {
+              mkdir: ensureDirStub,
+            },
+          },
+          '../../../utils/fs/copy': copyStub,
+          'cachedir': sinon.stub().returns(cacheDirPath),
+          '../../../utils/fs/dir-exists': dirExistsStub,
+          '../../../utils/serverless-utils/download': downloadStub,
+        });
+
+      const localOptions = {
+        stage: 'dev',
+        region: 'us-east-1',
+        function: 'first',
+      };
+      const localServerless = new Serverless({ commands: [], options: {} });
+      localServerless.serviceDir = 'servicePath';
+      localServerless.cli = new CLI(localServerless);
+      localServerless.processedInput = { commands: ['invoke'] };
+      localServerless.service.layers = {};
+
+      const localProvider = new AwsProvider(localServerless, localOptions);
+      localServerless.setProvider('aws', localProvider);
+
+      const invokeLocal = new ProxyquiredAwsInvokeLocal(localServerless, localOptions);
+      invokeLocal.provider = localProvider;
+      invokeLocal.options.functionObj = {
+        layers: ['arn:aws:lambda:us-east-1:123456789012:layer:my-layer:3'],
+      };
+
+      const expectedLayerPath = path.join('.serverless', 'layers', 'my-layer', '3');
+      const expectedCachePath = path.join(cacheDirPath, 'invokeLocal', 'layers', 'my-layer', '3');
+      const expectedCredentials = localProvider.getAwsSdkV3CredentialsProvider();
+
+      const result = await invokeLocal.getLayerPaths();
+
+      expect(dirExistsStub.firstCall.args[0]).to.equal(expectedLayerPath);
+      expect(dirExistsStub.secondCall.args[0]).to.equal(expectedCachePath);
+      expect(ensureDirStub.calledOnceWithExactly(expectedCachePath, { recursive: true })).to.equal(
+        true
+      );
+      expect(awsSdkV3Stub.sends).to.have.length(1);
+      expect(awsSdkV3Stub.sends[0]).to.include({
+        service: 'Lambda',
+        method: 'getLayerVersion',
+        commandName: 'GetLayerVersionCommand',
+      });
+      expect(awsSdkV3Stub.sends[0].input).to.deep.equal({
+        LayerName: 'arn:aws:lambda:us-east-1:123456789012:layer:my-layer',
+        VersionNumber: 3,
+      });
+      expect(awsSdkV3Stub.sends[0].clientConfig.region).to.equal('us-east-1');
+      expect(awsSdkV3Stub.sends[0].clientConfig.credentials).to.equal(expectedCredentials);
+      expect(
+        downloadStub.calledOnceWithExactly(
+          'https://layers.example.test/download?Signature=opaque',
+          expectedCachePath,
+          { extract: true }
+        )
+      ).to.equal(true);
+      expect(copyStub.calledOnceWithExactly(expectedCachePath, expectedLayerPath)).to.equal(true);
+      expect(result).to.deep.equal([expectedLayerPath]);
+    });
+
+    it('uses provider-level remote layers when function layers are not configured', async () => {
+      const cacheDirPath = path.join(os.tmpdir(), 'serverless-cache');
+      const downloadStub = sinon.stub().resolves();
+      const dirExistsStub = sinon.stub().resolves(false);
+      const ensureDirStub = sinon.stub().resolves();
+      const copyStub = sinon.stub().resolves();
+      const awsSdkV3Stub = configureAwsSdkV3Stub({
+        Lambda: {
+          getLayerVersion: {
+            Content: {
+              Location: 'https://layers.example.test/provider-layer.zip',
+            },
+          },
+        },
+      });
+      const { invokeLocal, localServerless } = createRemoteLayerTestContext({
+        awsSdkV3Stub,
+        cacheDirPath,
+        copyStub,
+        dirExistsStub,
+        downloadStub,
+        ensureDirStub,
+      });
+      localServerless.service.provider.layers = [
+        'arn:aws:lambda:us-east-1:123456789012:layer:provider-layer:7',
+      ];
+      invokeLocal.options.functionObj = {};
+
+      const expectedLayerPath = path.join('.serverless', 'layers', 'provider-layer', '7');
+      const expectedCachePath = path.join(
+        cacheDirPath,
+        'invokeLocal',
+        'layers',
+        'provider-layer',
+        '7'
+      );
+      const result = await invokeLocal.getLayerPaths();
+
+      expect(awsSdkV3Stub.sends).to.have.length(1);
+      expect(awsSdkV3Stub.sends[0].input).to.deep.equal({
+        LayerName: 'arn:aws:lambda:us-east-1:123456789012:layer:provider-layer',
+        VersionNumber: 7,
+      });
+      expect(
+        downloadStub.calledOnceWithExactly(
+          'https://layers.example.test/provider-layer.zip',
+          expectedCachePath,
+          { extract: true }
+        )
+      ).to.equal(true);
+      expect(copyStub.calledOnceWithExactly(expectedCachePath, expectedLayerPath)).to.equal(true);
+      expect(result).to.deep.equal([expectedLayerPath]);
+    });
+
+    it('uses existing local remote layer contents without SDK lookup or download', async () => {
+      const cacheDirPath = path.join(os.tmpdir(), 'serverless-cache');
+      const downloadStub = sinon.stub().resolves();
+      const dirExistsStub = sinon.stub().resolves(true);
+      const ensureDirStub = sinon.stub().resolves();
+      const copyStub = sinon.stub().resolves();
+      const awsSdkV3Stub = configureAwsSdkV3Stub({
+        Lambda: {
+          getLayerVersion: {
+            Content: { Location: 'https://layers.example.test/unused.zip' },
+          },
+        },
+      });
+      const { invokeLocal } = createRemoteLayerTestContext({
+        awsSdkV3Stub,
+        cacheDirPath,
+        copyStub,
+        dirExistsStub,
+        downloadStub,
+        ensureDirStub,
+      });
+      invokeLocal.options.functionObj = {
+        layers: ['arn:aws:lambda:us-east-1:123456789012:layer:my-layer:3'],
+      };
+
+      const expectedLayerPath = path.join('.serverless', 'layers', 'my-layer', '3');
+      const expectedCachePath = path.join(cacheDirPath, 'invokeLocal', 'layers', 'my-layer', '3');
+      const result = await invokeLocal.getLayerPaths();
+
+      expect(dirExistsStub.calledOnceWithExactly(expectedLayerPath)).to.equal(true);
+      expect(awsSdkV3Stub.sends).to.have.length(0);
+      expect(downloadStub).to.not.have.been.called;
+      expect(copyStub.calledOnceWithExactly(expectedCachePath, expectedLayerPath)).to.equal(true);
+      expect(result).to.deep.equal([expectedLayerPath]);
+    });
+
+    it('uses cached remote layer contents without SDK lookup or download', async () => {
+      const cacheDirPath = path.join(os.tmpdir(), 'serverless-cache');
+      const downloadStub = sinon.stub().resolves();
+      const dirExistsStub = sinon.stub();
+      dirExistsStub.onFirstCall().resolves(false).onSecondCall().resolves(true);
+      const ensureDirStub = sinon.stub().resolves();
+      const copyStub = sinon.stub().resolves();
+      const awsSdkV3Stub = configureAwsSdkV3Stub({
+        Lambda: {
+          getLayerVersion: {
+            Content: { Location: 'https://layers.example.test/unused.zip' },
+          },
+        },
+      });
+      const { invokeLocal } = createRemoteLayerTestContext({
+        awsSdkV3Stub,
+        cacheDirPath,
+        copyStub,
+        dirExistsStub,
+        downloadStub,
+        ensureDirStub,
+      });
+      invokeLocal.options.functionObj = {
+        layers: ['arn:aws:lambda:us-east-1:123456789012:layer:my-layer:3'],
+      };
+
+      const expectedLayerPath = path.join('.serverless', 'layers', 'my-layer', '3');
+      const expectedCachePath = path.join(cacheDirPath, 'invokeLocal', 'layers', 'my-layer', '3');
+      const result = await invokeLocal.getLayerPaths();
+
+      expect(dirExistsStub.firstCall.args[0]).to.equal(expectedLayerPath);
+      expect(dirExistsStub.secondCall.args[0]).to.equal(expectedCachePath);
+      expect(awsSdkV3Stub.sends).to.have.length(0);
+      expect(ensureDirStub).to.not.have.been.called;
+      expect(downloadStub).to.not.have.been.called;
+      expect(copyStub.calledOnceWithExactly(expectedCachePath, expectedLayerPath)).to.equal(true);
+      expect(result).to.deep.equal([expectedLayerPath]);
+    });
+
+    it('downloads, extracts, caches, and copies a remote layer from an opaque content location', async () => {
+      const originalCwd = process.cwd();
+      const tempRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'invoke-local-layer-'));
+      const zip = new AdmZip();
+      zip.addFile('nodejs/node_modules/test-dep/index.js', Buffer.from('module.exports = 123;'));
+      const zipBuffer = zip.toBuffer();
+
+      const server = http.createServer((req, res) => {
+        if (req.url === '/layer-download?Signature=opaque') {
+          res.statusCode = 200;
+          res.setHeader('Content-Type', 'application/zip');
+          res.end(zipBuffer);
+          return;
+        }
+
+        res.statusCode = 404;
+        res.end();
+      });
+
+      await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const baseUrl = `http://127.0.0.1:${server.address().port}`;
+
+      const ProxyquiredAwsInvokeLocal = proxyquire
+        .noCallThru()
+        .load('../../../../../../lib/plugins/aws/invoke-local/index', {
+          ...configureAwsSdkV3Stub({
+            Lambda: {
+              getLayerVersion: {
+                Content: {
+                  Location: `${baseUrl}/layer-download?Signature=opaque`,
+                },
+              },
+            },
+          }).modulesCacheStub,
+          '../../../utils/get-stdin': sinon.stub().resolves(''),
+          '../../../utils/spawn': sinon.stub().resolves({
+            stdoutBuffer: Buffer.from('Mocked output'),
+          }),
+          'cachedir': sinon.stub().returns(path.join(tempRoot, 'cache-root')),
+        });
+
+      try {
+        process.chdir(tempRoot);
+
+        const localOptions = {
+          stage: 'dev',
+          region: 'us-east-1',
+          function: 'first',
+        };
+        const localServerless = new Serverless({ commands: [], options: {} });
+        localServerless.serviceDir = tempRoot;
+        localServerless.cli = new CLI(localServerless);
+        localServerless.processedInput = { commands: ['invoke'] };
+        localServerless.service.layers = {};
+
+        const localProvider = new AwsProvider(localServerless, localOptions);
+        localServerless.setProvider('aws', localProvider);
+
+        const invokeLocal = new ProxyquiredAwsInvokeLocal(localServerless, localOptions);
+        invokeLocal.provider = localProvider;
+        invokeLocal.options.functionObj = {
+          layers: ['arn:aws:lambda:us-east-1:123456789012:layer:my-layer:3'],
+        };
+
+        const result = await invokeLocal.getLayerPaths();
+        const expectedLayerPath = path.join('.serverless', 'layers', 'my-layer', '3');
+        const copiedFilePath = path.join(
+          tempRoot,
+          expectedLayerPath,
+          'nodejs',
+          'node_modules',
+          'test-dep',
+          'index.js'
+        );
+        const cachedFilePath = path.join(
+          tempRoot,
+          'cache-root',
+          'invokeLocal',
+          'layers',
+          'my-layer',
+          '3',
+          'nodejs',
+          'node_modules',
+          'test-dep',
+          'index.js'
+        );
+
+        expect(result).to.deep.equal([expectedLayerPath]);
+        expect(await fsp.readFile(copiedFilePath, 'utf8')).to.equal('module.exports = 123;');
+        expect(await fsp.readFile(cachedFilePath, 'utf8')).to.equal('module.exports = 123;');
+      } finally {
+        process.chdir(originalCwd);
+        await new Promise((resolve, reject) => {
+          server.close((error) => {
+            if (error) {
+              reject(error);
+              return;
+            }
+
+            resolve();
+          });
+        });
+        await fsp.rm(tempRoot, { recursive: true, force: true });
+      }
+    });
+
+    it('limits concurrent remote layer lookups to 6', async () => {
+      const cacheDirPath = path.join(os.tmpdir(), 'serverless-cache');
+      const pendingResolvers = [];
+      let activeRequests = 0;
+      let observedMaxActiveRequests = 0;
+      const awsSdkV3Stub = configureAwsSdkV3Stub({
+        Lambda: {
+          getLayerVersion: async (input) => {
+            activeRequests += 1;
+            observedMaxActiveRequests = Math.max(observedMaxActiveRequests, activeRequests);
+            expect(activeRequests).to.be.at.most(6);
+            await new Promise((resolve) => pendingResolvers.push(resolve));
+            activeRequests -= 1;
+            return {
+              Content: {
+                Location: `https://layers.example.test/${input.VersionNumber}.zip`,
+              },
+            };
+          },
+        },
+      });
+      const ProxyquiredAwsInvokeLocal = proxyquire
+        .noCallThru()
+        .load('../../../../../../lib/plugins/aws/invoke-local/index', {
+          ...awsSdkV3Stub.modulesCacheStub,
+          '../../../utils/get-stdin': sinon.stub().resolves(''),
+          '../../../utils/spawn': sinon.stub().resolves({ stdoutBuffer: Buffer.from('Mocked') }),
+          'fs': {
+            promises: {
+              mkdir: sinon.stub().resolves(),
+            },
+          },
+          '../../../utils/fs/copy': sinon.stub().resolves(),
+          'cachedir': sinon.stub().returns(cacheDirPath),
+          '../../../utils/fs/dir-exists': sinon.stub().resolves(false),
+          '../../../utils/serverless-utils/download': sinon.stub().resolves(),
+        });
+      const localOptions = {
+        stage: 'dev',
+        region: 'us-east-1',
+        function: 'first',
+      };
+      const localServerless = new Serverless({ commands: [], options: {} });
+      localServerless.serviceDir = 'servicePath';
+      localServerless.cli = new CLI(localServerless);
+      localServerless.processedInput = { commands: ['invoke'] };
+      localServerless.service.layers = {};
+      const localProvider = new AwsProvider(localServerless, localOptions);
+      localServerless.setProvider('aws', localProvider);
+      const invokeLocal = new ProxyquiredAwsInvokeLocal(localServerless, localOptions);
+      invokeLocal.provider = localProvider;
+      invokeLocal.options.functionObj = {
+        layers: Array.from(
+          { length: 10 },
+          (ignored, index) =>
+            `arn:aws:lambda:us-east-1:123456789012:layer:layer-${index}:${index + 1}`
+        ),
+      };
+
+      const promise = invokeLocal.getLayerPaths();
+
+      for (let index = 0; index < 20 && pendingResolvers.length < 6; index += 1) {
+        await Promise.resolve();
+      }
+      expect(observedMaxActiveRequests).to.equal(6);
+      await releasePendingRequestsUntilSettled(pendingResolvers, promise);
+      expect(observedMaxActiveRequests).to.equal(6);
+      expect(awsSdkV3Stub.sends).to.have.length(10);
+      expect(awsSdkV3Stub.clients.filter(({ service }) => service === 'Lambda')).to.have.length(1);
+      const expectedCredentials = localProvider.getAwsSdkV3CredentialsProvider();
+      expect(
+        awsSdkV3Stub.sends.every(
+          ({ clientConfig }) =>
+            clientConfig.region === 'us-east-1' && clientConfig.credentials === expectedCredentials
+        )
+      ).to.equal(true);
     });
   });
 
@@ -823,6 +1860,47 @@ describe('AwsInvokeLocal', () => {
       const envVarsFromOptions = awsInvokeLocal.getEnvVarsFromOptions();
 
       expect(envVarsFromOptions).to.be.eql({ SOME_ENV_VAR: 'value1=value2' });
+    });
+
+    it('accepts --env __proto__=value without polluting Object.prototype', () => {
+      awsInvokeLocal.options.env = '__proto__=adversarial';
+
+      const result = awsInvokeLocal.getEnvVarsFromOptions();
+
+      expect(Reflect.get(result, '__proto__')).to.equal('adversarial');
+      expect(Object.prototype.hasOwnProperty.call(result, '__proto__')).to.equal(true);
+      expect({}.adversarial).to.equal(undefined);
+      expect({}.polluted).to.equal(undefined);
+    });
+
+    it('accepts --env constructor=value without changing Object.prototype.constructor', () => {
+      awsInvokeLocal.options.env = 'constructor=fake';
+      const originalConstructor = Object.prototype.constructor;
+
+      const result = awsInvokeLocal.getEnvVarsFromOptions();
+
+      expect(result.constructor).to.equal('fake');
+      expect(Object.prototype.constructor).to.equal(originalConstructor);
+    });
+
+    it('accepts multiple unsafe-named --env flags together', () => {
+      awsInvokeLocal.options.env = [
+        '__proto__=one',
+        'constructor=two',
+        'prototype=three',
+        'SAFE=four',
+      ];
+
+      const result = awsInvokeLocal.getEnvVarsFromOptions();
+
+      expect(Object.keys(result).sort()).to.deep.equal(
+        ['__proto__', 'SAFE', 'constructor', 'prototype'].sort()
+      );
+      expect(Reflect.get(result, '__proto__')).to.equal('one');
+      expect(result.constructor).to.equal('two');
+      expect(result.prototype).to.equal('three');
+      expect(result.SAFE).to.equal('four');
+      expect({}.polluted).to.equal(undefined);
     });
   });
 
@@ -1070,7 +2148,7 @@ describe('test/unit/lib/plugins/aws/invokeLocal/index.test.js', () => {
           },
           configExt: {
             provider: {
-              runtime: 'nodejs18.x',
+              runtime: 'nodejs20.x',
               environment: {
                 PROVIDER_LEVEL_VAR: 'PROVIDER_LEVEL_VAR_VALUE',
                 NULL_VAR: null,
@@ -1088,7 +2166,7 @@ describe('test/unit/lib/plugins/aws/invokeLocal/index.test.js', () => {
         });
         const outputAsJson = (() => {
           try {
-            return JSON.parse(response.output);
+            return parseJsonOutput(response.output);
           } catch (error) {
             log.error('Unexpected response output: %s', response.output);
             throw error;
@@ -1257,7 +2335,7 @@ describe('test/unit/lib/plugins/aws/invokeLocal/index.test.js', () => {
         options: { function: 'remainingTime' },
       });
 
-      const body = JSON.parse(output).body;
+      const body = parseJsonOutput(output).body;
       const [firstRemainingMs, secondRemainingMs, thirdRemainingMs] = JSON.parse(body).data;
       expect(firstRemainingMs).to.be.lte(3000);
       expect(secondRemainingMs).to.be.lte(2910);
@@ -1282,6 +2360,15 @@ describe('test/unit/lib/plugins/aws/invokeLocal/index.test.js', () => {
 
       expect(output).to.include('Invoked');
     });
+    it('should support ES module handlers whose path contains URL-significant characters', async () => {
+      const { output } = await runServerless({
+        fixture: 'invocation',
+        command: 'invoke local',
+        options: { function: 'asyncEsmSpecialPath' },
+      });
+
+      expect(output).to.include('Invoked');
+    });
   });
 
   describe('Python', () => {
@@ -1289,7 +2376,7 @@ describe('test/unit/lib/plugins/aws/invokeLocal/index.test.js', () => {
       const executable = process.platform === 'win32' ? 'python.exe' : 'python';
       try {
         await spawnExt(executable, ['--version']);
-      } catch (err) {
+      } catch {
         skipWithNotice(this, 'Python runtime is not installed');
       }
     });
@@ -1303,7 +2390,7 @@ describe('test/unit/lib/plugins/aws/invokeLocal/index.test.js', () => {
           options: { function: 'pythonRemainingTime' },
         });
 
-        const { start, stop } = JSON.parse(output);
+        const { start, stop } = parseJsonOutput(output);
         expect(start).to.lte(3000);
         expect(stop).to.lte(2910);
       });
@@ -1315,7 +2402,7 @@ describe('test/unit/lib/plugins/aws/invokeLocal/index.test.js', () => {
       const executable = process.platform === 'win32' ? 'ruby.exe' : 'ruby';
       try {
         await spawnExt(executable, ['--version']);
-      } catch (err) {
+      } catch {
         skipWithNotice(this, 'Ruby runtime is not installed');
       }
     });
@@ -1338,7 +2425,7 @@ describe('test/unit/lib/plugins/aws/invokeLocal/index.test.js', () => {
         options: { function: 'rubyRemainingTime' },
       });
 
-      const { start, stop } = JSON.parse(output);
+      const { start, stop } = parseJsonOutput(output);
       expect(start).to.lte(6000);
       expect(stop).to.lte(5910);
     });
@@ -1349,7 +2436,7 @@ describe('test/unit/lib/plugins/aws/invokeLocal/index.test.js', () => {
         options: { function: 'rubyDeadline' },
       });
 
-      const { deadlineMs } = JSON.parse(output);
+      const { deadlineMs } = parseJsonOutput(output);
       expect(deadlineMs).to.be.gt(Date.now());
     });
   });
@@ -1369,6 +2456,6 @@ describe('test/unit/lib/plugins/aws/invokeLocal/index.test.js', () => {
     // - Ensure all other tests are skipped
 
     testRuntime('callback', ['--docker']);
-    it('TODO: should support "provided" runtime in docker invocation', () => {});
+    it('TODO: should support custom runtimes in docker invocation', () => {});
   });
 });

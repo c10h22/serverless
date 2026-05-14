@@ -1,12 +1,14 @@
 # Plugins
 
-A plugin is custom JavaScript code that extends the Serverless Framework with new features.
+A plugin is custom JavaScript code that extends Serverless with new features.
 
-If you or your organization have a specific workflow, install a pre-written plugin or write one to customize the Framework to your needs.
+If you or your organization have a specific workflow, install a pre-written plugin or write one to customize Serverless to your needs.
 
-Since the Serverless Framework is a group of "core" plugins, custom plugins are written exactly the same way as core plugins. Learn more about [creating a custom plugin](creating-plugins.md).
+Since osls is a group of "core" plugins, custom plugins are written exactly the same way as core plugins. Learn more about [creating a custom plugin](creating-plugins.md).
 
-Explore existing plugins in the [Serverless Framework Plugins repository](https://www.serverless.com/plugins).
+> **Security note:** Plugins are JavaScript code that osls loads and executes. Treat configured plugins, local plugin paths, and `plugins.localPath` as trusted code. Do not run osls commands against untrusted projects, templates, or pull requests that configure plugins.
+
+Install only plugins from sources you trust.
 
 ## Installing plugins
 
@@ -47,6 +49,14 @@ custom:
 
 Note for plugin authors: read [Extending the configuration](custom-configuration.md) to learn how to enhance `serverless.yml` with configuration validation.
 
+AWS plugin authors should use AWS SDK v3 clients directly and obtain
+osls-resolved client configuration with `provider.getAwsSdkV3Config()`.
+See [AWS plugins](creating-plugins.md#aws-plugins) for details.
+
+Only helpers documented in the plugin guides are considered supported for
+plugin authors. Avoid importing osls internal files under `lib/**`
+tree.
+
 ## Service local plugin
 
 If you are working on a plugin, or have a plugin that is just designed for one project, it can be loaded from local files:
@@ -58,9 +68,11 @@ plugins:
 
 The path must start with `./` and is relative to the root of your service.
 
+The legacy object form can also set `plugins.localPath` to change where non-relative plugin names are loaded from. Use `plugins.localPath` only with trusted directories.
+
 ## Load Order
 
-Keep in mind that the order you define your plugins matters. Serverless loads all the core plugins, and then the custom plugins in the order you've defined them.
+Keep in mind that the order you define your plugins matters. osls loads all the core plugins, and then the custom plugins in the order you've defined them.
 
 ```yml
 # serverless.yml

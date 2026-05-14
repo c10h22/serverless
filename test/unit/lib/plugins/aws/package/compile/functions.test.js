@@ -1,22 +1,20 @@
 'use strict';
 
-const AWS = require('aws-sdk');
-const fse = require('fs-extra');
+const fs = require('fs');
 const fsp = require('fs').promises;
 const path = require('path');
+const { Readable, Writable } = require('node:stream');
+const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 const chai = require('chai');
 const sinon = require('sinon');
+const proxyquire = require('proxyquire');
 const AwsProvider = require('../../../../../../../lib/plugins/aws/provider');
 const AwsCompileFunctions = require('../../../../../../../lib/plugins/aws/package/compile/functions');
 const Serverless = require('../../../../../../../lib/serverless');
 const runServerless = require('../../../../../../utils/run-serverless');
 const fixtures = require('../../../../../../fixtures/programmatic');
-const getHashForFilePath = require('../../../../../../../lib/plugins/aws/package/lib/get-hash-for-file-path');
 
 const { getTmpDirPath, createTmpFile } = require('../../../../../../utils/fs');
-
-chai.use(require('chai-as-promised'));
-chai.use(require('sinon-chai'));
 
 const expect = chai.expect;
 
@@ -75,41 +73,76 @@ describe('AwsCompileFunctions', () => {
   });
 
   describe('#downloadPackageArtifacts()', () => {
-    let requestStub;
+    let sendStub;
     let testFilePath;
     const s3BucketName = 'test-bucket';
     const s3ArtifactName = 's3-hosted-artifact.zip';
+    const downloadedArtifactContent = 'downloaded artifact content';
 
     beforeEach(() => {
       testFilePath = createTmpFile('dummy-artifact');
-      requestStub = sinon.stub(AWS, 'S3').returns({
-        getObject: () => ({
-          createReadStream() {
-            return fse.createReadStream(testFilePath);
-          },
-        }),
+      fs.writeFileSync(testFilePath, downloadedArtifactContent);
+      sendStub = sinon.stub(S3Client.prototype, 'send').resolves({
+        Body: fs.createReadStream(testFilePath),
       });
     });
 
     afterEach(() => {
-      AWS.S3.restore();
+      S3Client.prototype.send.restore();
+      if (fs.createWriteStream.restore) fs.createWriteStream.restore();
     });
+
+    function createAwsCompileFunctionsWithS3ClientStub({ onSend } = {}) {
+      const s3Clients = [];
+      class FakeGetObjectCommand {
+        constructor(input) {
+          this.input = input;
+        }
+      }
+      class FakeS3Client {
+        constructor(config) {
+          this.config = config;
+          s3Clients.push(this);
+        }
+
+        async send(command) {
+          if (onSend) return onSend({ command, client: this, FakeGetObjectCommand });
+          return undefined;
+        }
+      }
+      const AwsCompileFunctionsWithClientStub = proxyquire(
+        '../../../../../../../lib/plugins/aws/package/compile/functions',
+        {
+          '@aws-sdk/client-s3': {
+            S3Client: FakeS3Client,
+            GetObjectCommand: FakeGetObjectCommand,
+          },
+        }
+      );
+
+      return { AwsCompileFunctionsWithClientStub, FakeGetObjectCommand, s3Clients };
+    }
 
     it('should download the file and replace the artifact path for function packages', async () => {
       awsCompileFunctions.serverless.service.package.individually = true;
-      awsCompileFunctions.serverless.service.functions[
-        functionName
-      ].package.artifact = `https://s3.amazonaws.com/${s3BucketName}/${s3ArtifactName}`;
+      awsCompileFunctions.serverless.service.functions[functionName].package.artifact =
+        `https://s3.amazonaws.com/${s3BucketName}/${s3ArtifactName}`;
 
       return expect(awsCompileFunctions.downloadPackageArtifacts()).to.be.fulfilled.then(() => {
-        const artifactFileName = awsCompileFunctions.serverless.service.functions[
-          functionName
-        ].package.artifact
-          .split(path.sep)
-          .pop();
+        const artifactFilePath =
+          awsCompileFunctions.serverless.service.functions[functionName].package.artifact;
+        const artifactFileName = artifactFilePath.split(path.sep).pop();
 
-        expect(requestStub.callCount).to.equal(1);
+        expect(sendStub.callCount).to.equal(1);
+        expect(sendStub.firstCall.args[0]).to.be.instanceOf(GetObjectCommand);
+        expect(sendStub.firstCall.args[0].input).to.deep.equal({
+          Bucket: s3BucketName,
+          Key: s3ArtifactName,
+        });
         expect(artifactFileName).to.equal(s3ArtifactName);
+        return expect(fsp.readFile(artifactFilePath, 'utf8')).to.eventually.equal(
+          downloadedArtifactContent
+        );
       });
     });
 
@@ -119,27 +152,164 @@ describe('AwsCompileFunctions', () => {
       awsCompileFunctions.serverless.service.package.artifact = `https://s3.amazonaws.com/${s3BucketName}/${s3ArtifactName}`;
 
       return expect(awsCompileFunctions.downloadPackageArtifacts()).to.be.fulfilled.then(() => {
-        const artifactFileName = awsCompileFunctions.serverless.service.package.artifact
-          .split(path.sep)
-          .pop();
+        const artifactFilePath = awsCompileFunctions.serverless.service.package.artifact;
+        const artifactFileName = artifactFilePath.split(path.sep).pop();
 
-        expect(requestStub.callCount).to.equal(1);
+        expect(sendStub.callCount).to.equal(1);
+        expect(sendStub.firstCall.args[0]).to.be.instanceOf(GetObjectCommand);
+        expect(sendStub.firstCall.args[0].input).to.deep.equal({
+          Bucket: s3BucketName,
+          Key: s3ArtifactName,
+        });
         expect(artifactFileName).to.equal(s3ArtifactName);
+        return expect(fsp.readFile(artifactFilePath, 'utf8')).to.eventually.equal(
+          downloadedArtifactContent
+        );
       });
     });
 
-    it('should not access AWS.S3 if URL is not an S3 URl', async () => {
-      AWS.S3.restore();
-      const myRequestStub = sinon.stub(AWS, 'S3').returns({
-        getObject: () => {
-          throw new Error('should not be invoked');
-        },
+    it('should strip query parameters when downloading presigned S3 artifact URLs', async () => {
+      awsCompileFunctions.serverless.service.package.individually = true;
+      awsCompileFunctions.serverless.service.functions[functionName].package.artifact =
+        `https://s3.amazonaws.com/${s3BucketName}/path/to/${s3ArtifactName}?X-Amz-Signature=secret`;
+
+      await expect(awsCompileFunctions.downloadPackageArtifacts()).to.be.fulfilled;
+
+      const artifactFilePath =
+        awsCompileFunctions.serverless.service.functions[functionName].package.artifact;
+
+      expect(sendStub.callCount).to.equal(1);
+      expect(sendStub.firstCall.args[0]).to.be.instanceOf(GetObjectCommand);
+      expect(sendStub.firstCall.args[0].input).to.deep.equal({
+        Bucket: s3BucketName,
+        Key: `path/to/${s3ArtifactName}`,
       });
+      expect(path.basename(artifactFilePath)).to.equal(s3ArtifactName);
+      expect(artifactFilePath).to.not.include('?');
+      expect(artifactFilePath).to.not.include('X-Amz');
+    });
+
+    it('should not access S3 if URL is not an S3 URL', async () => {
       awsCompileFunctions.serverless.service.functions[functionName].package.artifact =
         'https://s33amazonaws.com/this/that';
       return expect(awsCompileFunctions.downloadPackageArtifacts()).to.be.fulfilled.then(() => {
-        expect(myRequestStub.callCount).to.equal(1);
+        expect(sendStub).to.not.have.been.called;
       });
+    });
+
+    it('reuses S3 clients across repeated remote package artifact downloads in the same region', async () => {
+      const { AwsCompileFunctionsWithClientStub, s3Clients } =
+        createAwsCompileFunctionsWithS3ClientStub({
+          onSend: async ({ command, FakeGetObjectCommand }) => {
+            expect(command).to.be.instanceOf(FakeGetObjectCommand);
+            return { Body: fs.createReadStream(testFilePath) };
+          },
+        });
+      const compileFunctions = new AwsCompileFunctionsWithClientStub(serverless, {
+        stage: 'dev',
+        region: 'us-east-1',
+      });
+      compileFunctions.serverless.service.functions = {
+        first: {
+          handler: 'handler.first',
+          package: {
+            artifact: `https://s3.amazonaws.com/${s3BucketName}/first.zip`,
+          },
+        },
+        second: {
+          handler: 'handler.second',
+          package: {
+            artifact: `https://s3.amazonaws.com/${s3BucketName}/second.zip`,
+          },
+        },
+      };
+
+      await compileFunctions.downloadPackageArtifacts();
+
+      expect(s3Clients).to.have.length(1);
+    });
+
+    it('uses distinct S3 clients for distinct explicit remote artifact regions', async () => {
+      const { AwsCompileFunctionsWithClientStub, s3Clients } =
+        createAwsCompileFunctionsWithS3ClientStub();
+      const compileFunctions = new AwsCompileFunctionsWithClientStub(serverless, {
+        stage: 'dev',
+        region: 'eu-west-1',
+      });
+
+      await compileFunctions.getS3Client('eu-west-1');
+      await compileFunctions.getS3Client('us-east-1');
+
+      expect(s3Clients).to.have.length(2);
+      expect(s3Clients[0].config.region).to.equal('eu-west-1');
+      expect(s3Clients[1].config.region).to.equal('us-east-1');
+    });
+
+    it('should reject if the downloaded artifact stream errors', async () => {
+      const streamError = new Error('stream failed');
+      const errorStream = new Readable({
+        read() {
+          this.destroy(streamError);
+        },
+      });
+      sendStub.resolves({
+        Body: errorStream,
+      });
+      awsCompileFunctions.serverless.service.package.individually = true;
+      awsCompileFunctions.serverless.service.functions[functionName].package.artifact =
+        `https://s3.amazonaws.com/${s3BucketName}/${s3ArtifactName}`;
+      const originalArtifact =
+        awsCompileFunctions.serverless.service.functions[functionName].package.artifact;
+
+      await expect(awsCompileFunctions.downloadPackageArtifacts()).to.be.rejectedWith(streamError);
+      expect(
+        awsCompileFunctions.serverless.service.functions[functionName].package.artifact
+      ).to.equal(originalArtifact);
+    });
+
+    function setRemoteFunctionArtifact() {
+      awsCompileFunctions.serverless.service.package.individually = true;
+      awsCompileFunctions.serverless.service.functions[functionName].package.artifact =
+        `https://s3.amazonaws.com/${s3BucketName}/${s3ArtifactName}`;
+      return awsCompileFunctions.serverless.service.functions[functionName].package.artifact;
+    }
+
+    it('should reject and preserve artifact path when S3 getObject fails', async () => {
+      const error = new Error('getObject failed');
+      sendStub.rejects(error);
+      const originalArtifact = setRemoteFunctionArtifact();
+
+      await expect(awsCompileFunctions.downloadPackageArtifacts()).to.be.rejectedWith(error);
+      expect(
+        awsCompileFunctions.serverless.service.functions[functionName].package.artifact
+      ).to.equal(originalArtifact);
+    });
+
+    it('should reject and preserve artifact path when S3 getObject returns no body', async () => {
+      sendStub.resolves({});
+      const originalArtifact = setRemoteFunctionArtifact();
+
+      await expect(awsCompileFunctions.downloadPackageArtifacts()).to.be.rejected;
+      expect(
+        awsCompileFunctions.serverless.service.functions[functionName].package.artifact
+      ).to.equal(originalArtifact);
+    });
+
+    it('should reject and preserve artifact path when writing downloaded artifact fails', async () => {
+      const writeError = new Error('write failed');
+      sinon.stub(fs, 'createWriteStream').returns(
+        new Writable({
+          write(chunk, encoding, callback) {
+            callback(writeError);
+          },
+        })
+      );
+      const originalArtifact = setRemoteFunctionArtifact();
+
+      await expect(awsCompileFunctions.downloadPackageArtifacts()).to.be.rejectedWith(writeError);
+      expect(
+        awsCompileFunctions.serverless.service.functions[functionName].package.artifact
+      ).to.equal(originalArtifact);
     });
   });
 
@@ -190,9 +360,7 @@ describe('AwsCompileFunctions', () => {
       const { cfTemplate } = await runServerless({
         fixture: 'function',
         configExt: {
-          disabledDeprecations: ['PROVIDER_IAM_SETTINGS_V3'],
           provider: {
-            role: 'role-a',
             iam: { role: 'role-b' },
           },
         },
@@ -335,7 +503,7 @@ describe('AwsCompileFunctions', () => {
           Handler: 'func.function.handler',
           MemorySize: 1024,
           Role: { 'Fn::GetAtt': ['IamRoleLambdaExecution', 'Arn'] },
-          Runtime: 'nodejs18.x',
+          Runtime: 'nodejs24.x',
           Timeout: 6,
         },
       };
@@ -395,7 +563,7 @@ describe('AwsCompileFunctions', () => {
               Handler: 'func.function.handler',
               MemorySize: 1024,
               Role: { 'Fn::GetAtt': ['IamRoleLambdaExecution', 'Arn'] },
-              Runtime: 'nodejs18.x',
+              Runtime: 'nodejs24.x',
               Timeout: 6,
               DeadLetterConfig: {
                 TargetArn: 'arn:aws:sns:region:accountid:foo',
@@ -446,7 +614,7 @@ describe('AwsCompileFunctions', () => {
               Handler: 'func.function.handler',
               MemorySize: 1024,
               Role: { 'Fn::GetAtt': ['IamRoleLambdaExecution', 'Arn'] },
-              Runtime: 'nodejs18.x',
+              Runtime: 'nodejs24.x',
               Timeout: 6,
               DeadLetterConfig: {
                 TargetArn: {
@@ -488,7 +656,7 @@ describe('AwsCompileFunctions', () => {
               Handler: 'func.function.handler',
               MemorySize: 1024,
               Role: { 'Fn::GetAtt': ['IamRoleLambdaExecution', 'Arn'] },
-              Runtime: 'nodejs18.x',
+              Runtime: 'nodejs24.x',
               Timeout: 6,
               DeadLetterConfig: {
                 TargetArn: {
@@ -530,7 +698,7 @@ describe('AwsCompileFunctions', () => {
               Handler: 'func.function.handler',
               MemorySize: 1024,
               Role: { 'Fn::GetAtt': ['IamRoleLambdaExecution', 'Arn'] },
-              Runtime: 'nodejs18.x',
+              Runtime: 'nodejs24.x',
               Timeout: 6,
               DeadLetterConfig: {
                 TargetArn: {
@@ -572,7 +740,7 @@ describe('AwsCompileFunctions', () => {
               Handler: 'func.function.handler',
               MemorySize: 1024,
               Role: { 'Fn::GetAtt': ['IamRoleLambdaExecution', 'Arn'] },
-              Runtime: 'nodejs18.x',
+              Runtime: 'nodejs24.x',
               Timeout: 6,
               DeadLetterConfig: {
                 TargetArn: 'arn:aws:sns:region:accountid:foo',
@@ -639,7 +807,7 @@ describe('AwsCompileFunctions', () => {
               Handler: 'func.function.handler',
               MemorySize: 1024,
               Role: { 'Fn::GetAtt': ['IamRoleLambdaExecution', 'Arn'] },
-              Runtime: 'nodejs18.x',
+              Runtime: 'nodejs24.x',
               Timeout: 6,
               TracingConfig: {
                 Mode: 'Active',
@@ -696,7 +864,7 @@ describe('AwsCompileFunctions', () => {
           Handler: 'func.function.handler',
           MemorySize: 1024,
           Role: { 'Fn::GetAtt': ['IamRoleLambdaExecution', 'Arn'] },
-          Runtime: 'nodejs18.x',
+          Runtime: 'nodejs24.x',
           Timeout: 6,
           Environment: {
             Variables: {
@@ -738,6 +906,57 @@ describe('AwsCompileFunctions', () => {
       });
     });
 
+    it('should preserve unsafe environment variable names as own data properties', async () => {
+      awsCompileFunctions.serverless.service.provider.environment = JSON.parse(
+        '{"__proto__":{"Ref":"UnsafeProviderEnv"}}'
+      );
+      awsCompileFunctions.serverless.service.functions = {
+        func: {
+          handler: 'func.function.handler',
+          name: 'new-service-dev-func',
+          environment: JSON.parse('{"constructor":{"Ref":"UnsafeFunctionEnv"}}'),
+        },
+      };
+
+      await awsCompileFunctions.compileFunctions();
+
+      const variables =
+        awsCompileFunctions.serverless.service.provider.compiledCloudFormationTemplate.Resources
+          .FuncLambdaFunction.Properties.Environment.Variables;
+
+      expect(Object.getPrototypeOf(variables)).to.equal(Object.prototype);
+      expect(Object.getOwnPropertyDescriptor(variables, '__proto__').value).to.deep.equal({
+        Ref: 'UnsafeProviderEnv',
+      });
+      expect(Object.getOwnPropertyDescriptor(variables, 'constructor').value).to.deep.equal({
+        Ref: 'UnsafeFunctionEnv',
+      });
+    });
+
+    it('should preserve unsafe tag names as own data properties before rendering tag arrays', async () => {
+      awsCompileFunctions.serverless.service.provider.tags = JSON.parse(
+        '{"__proto__":"provider-tag"}'
+      );
+      awsCompileFunctions.serverless.service.functions = {
+        func: {
+          handler: 'func.function.handler',
+          name: 'new-service-dev-func',
+          tags: JSON.parse('{"constructor":"function-tag"}'),
+        },
+      };
+
+      await awsCompileFunctions.compileFunctions();
+
+      const tags =
+        awsCompileFunctions.serverless.service.provider.compiledCloudFormationTemplate.Resources
+          .FuncLambdaFunction.Properties.Tags;
+
+      expect(tags).to.deep.include.members([
+        { Key: '__proto__', Value: 'provider-tag' },
+        { Key: 'constructor', Value: 'function-tag' },
+      ]);
+    });
+
     it('should consider function based config when creating a function resource', async () => {
       const s3Folder = awsCompileFunctions.serverless.service.package.artifactDirectoryName;
       const s3FileName = awsCompileFunctions.serverless.service.package.artifact
@@ -763,7 +982,7 @@ describe('AwsCompileFunctions', () => {
           Handler: 'func.function.handler',
           MemorySize: 128,
           Role: { 'Fn::GetAtt': ['IamRoleLambdaExecution', 'Arn'] },
-          Runtime: 'nodejs18.x',
+          Runtime: 'nodejs24.x',
           Timeout: 10,
         },
       };
@@ -862,7 +1081,7 @@ describe('AwsCompileFunctions', () => {
           MemorySize: 1024,
           ReservedConcurrentExecutions: 5,
           Role: { 'Fn::GetAtt': ['IamRoleLambdaExecution', 'Arn'] },
-          Runtime: 'nodejs18.x',
+          Runtime: 'nodejs24.x',
           Timeout: 6,
         },
       };
@@ -918,7 +1137,7 @@ describe('AwsCompileFunctions', () => {
           MemorySize: 1024,
           ReservedConcurrentExecutions: 0,
           Role: { 'Fn::GetAtt': ['IamRoleLambdaExecution', 'Arn'] },
-          Runtime: 'nodejs18.x',
+          Runtime: 'nodejs24.x',
           Timeout: 6,
         },
       };
@@ -1020,6 +1239,19 @@ describe('AwsCompileFunctions', () => {
   });
 
   describe('#compileRole()', () => {
+    it('should ignore inherited Fn::GetAtt role markers', () => {
+      const compiledFunction = {
+        Properties: {},
+        DependsOn: [],
+      };
+      const role = Object.create({ 'Fn::GetAtt': ['InjectedRole', 'Arn'] });
+
+      awsCompileFunctions.compileRole(compiledFunction, role);
+
+      expect(compiledFunction.Properties.Role).to.equal(role);
+      expect(compiledFunction.DependsOn).to.deep.equal([]);
+    });
+
     it('should not set unset properties when not specified in yml (layers, vpc, etc)', async () => {
       const s3Folder = awsCompileFunctions.serverless.service.package.artifactDirectoryName;
       const s3FileName = awsCompileFunctions.serverless.service.package.artifact
@@ -1044,7 +1276,7 @@ describe('AwsCompileFunctions', () => {
           Handler: 'func.function.handler',
           MemorySize: 1024,
           Role: { 'Fn::GetAtt': ['IamRoleLambdaExecution', 'Arn'] },
-          Runtime: 'nodejs18.x',
+          Runtime: 'nodejs24.x',
           Timeout: 6,
         },
       };
@@ -1082,7 +1314,7 @@ describe('AwsCompileFunctions', () => {
           Handler: 'func.function.handler',
           MemorySize: 1024,
           Role: { 'Fn::GetAtt': ['IamRoleLambdaExecution', 'Arn'] },
-          Runtime: 'nodejs18.x',
+          Runtime: 'nodejs24.x',
           Timeout: 6,
           Layers: ['arn:aws:xxx:*:*'],
         },
@@ -1169,7 +1401,7 @@ describe('lib/plugins/aws/package/compile/functions/index.test.js', () => {
               providerCfIfEnvVar: { 'Fn::If': ['cond', 'first', 'second'] },
             },
             memorySize: 4096,
-            runtime: 'nodejs18.x',
+            runtime: 'nodejs20.x',
             runtimeManagement: {
               mode: 'manual',
               arn: 'arn:aws:lambda:us-east-1:111111111111::runtime:7b620fc2e66107a1046b140b9d320295811af3ad5d4c6a011fad1fa65127e9e6I',
@@ -1192,7 +1424,7 @@ describe('lib/plugins/aws/package/compile/functions/index.test.js', () => {
                 sharedEnvVar: 'valueFromFunction',
               },
               memorySize: 2048,
-              runtime: 'nodejs18.x',
+              runtime: 'nodejs20.x',
               runtimeManagement: 'onFunctionUpdate',
               versionFunction: true,
             },
@@ -1390,6 +1622,134 @@ describe('lib/plugins/aws/package/compile/functions/index.test.js', () => {
       expect(Runtime).to.equal(fooFunctionConfig.runtime);
     });
 
+    it('should accept `provider.runtime: java25`', async () => {
+      const {
+        awsNaming: localNaming,
+        cfTemplate: { Resources: localResources },
+      } = await runServerless({
+        fixture: 'function',
+        command: 'package',
+        configExt: {
+          provider: {
+            runtime: 'java25',
+          },
+        },
+      });
+
+      expect(localResources[localNaming.getLambdaLogicalId('basic')].Properties.Runtime).to.equal(
+        'java25'
+      );
+      expect(localResources[localNaming.getLambdaLogicalId('other')].Properties.Runtime).to.equal(
+        'java25'
+      );
+    });
+
+    it('should accept `functions[].runtime: java25`', async () => {
+      const {
+        awsNaming: localNaming,
+        cfTemplate: { Resources: localResources },
+      } = await runServerless({
+        fixture: 'function',
+        command: 'package',
+        configExt: {
+          functions: {
+            basic: {
+              runtime: 'java25',
+            },
+          },
+        },
+      });
+
+      expect(localResources[localNaming.getLambdaLogicalId('basic')].Properties.Runtime).to.equal(
+        'java25'
+      );
+      expect(localResources[localNaming.getLambdaLogicalId('other')].Properties.Runtime).to.equal(
+        'nodejs20.x'
+      );
+    });
+
+    it('should accept `provider.runtime: ruby4.0`', async () => {
+      const {
+        awsNaming: localNaming,
+        cfTemplate: { Resources: localResources },
+      } = await runServerless({
+        fixture: 'function',
+        command: 'package',
+        configExt: {
+          provider: {
+            runtime: 'ruby4.0',
+          },
+        },
+      });
+
+      expect(localResources[localNaming.getLambdaLogicalId('basic')].Properties.Runtime).to.equal(
+        'ruby4.0'
+      );
+      expect(localResources[localNaming.getLambdaLogicalId('other')].Properties.Runtime).to.equal(
+        'ruby4.0'
+      );
+    });
+
+    it('should accept `functions[].runtime: ruby4.0`', async () => {
+      const {
+        awsNaming: localNaming,
+        cfTemplate: { Resources: localResources },
+      } = await runServerless({
+        fixture: 'function',
+        command: 'package',
+        configExt: {
+          functions: {
+            basic: {
+              runtime: 'ruby4.0',
+            },
+          },
+        },
+      });
+
+      expect(localResources[localNaming.getLambdaLogicalId('basic')].Properties.Runtime).to.equal(
+        'ruby4.0'
+      );
+      expect(localResources[localNaming.getLambdaLogicalId('other')].Properties.Runtime).to.equal(
+        'nodejs20.x'
+      );
+    });
+
+    it('should reject deprecated `provider.runtime` values', () => {
+      return expect(
+        runServerless({
+          fixture: 'function',
+          command: 'package',
+          configExt: {
+            provider: {
+              runtime: 'provided',
+            },
+          },
+        })
+      ).to.eventually.be.rejected.and.have.property(
+        'code',
+        'INVALID_NON_SCHEMA_COMPLIANT_CONFIGURATION'
+      );
+    });
+
+    it('should reject deprecated `functions[].runtime` values', () => {
+      return expect(
+        runServerless({
+          fixture: 'function',
+          command: 'package',
+          configExt: {
+            functions: {
+              basic: {
+                runtime: 'python3.9',
+              },
+            },
+          },
+        })
+      ).to.eventually.be.rejected.and.have.property(
+        'code',
+        'INVALID_NON_SCHEMA_COMPLIANT_CONFIGURATION'
+      );
+    });
+
     it('should support `provider.runtimeManagement`', () => {
       const providerConfig = serviceConfig.provider;
 
@@ -1560,7 +1920,7 @@ describe('lib/plugins/aws/package/compile/functions/index.test.js', () => {
     });
   });
 
-  describe('`provider.role` variants', () => {
+  describe('`provider.iam.role` variants', () => {
     it('should support resource name', async () => {
       const { awsNaming, cfTemplate, fixtureData } = await runServerless({
         fixture: 'function',
@@ -1601,49 +1961,6 @@ describe('lib/plugins/aws/package/compile/functions/index.test.js', () => {
       expect(funcResource.Properties.Role).to.deep.equal(
         fixtureData.serviceConfig.provider.iam.role
       );
-    });
-  });
-
-  describe('`provider.lambdaHashingVersion` support', () => {
-    it('CodeSha256 for functions should be the same for default hashing and for 20200924 version', async () => {
-      const { servicePath: serviceDir, updateConfig } = await fixtures.setup('function', {
-        configExt: {
-          provider: {
-            versionFunctions: true,
-          },
-        },
-      });
-
-      const { cfTemplate: originalTemplate, awsNaming } = await runServerless({
-        cwd: serviceDir,
-        command: 'package',
-      });
-
-      const functionCfLogicalId = awsNaming.getLambdaLogicalId('basic');
-
-      const originalVersionCfConfig = Object.values(originalTemplate.Resources).find(
-        (resource) =>
-          resource.Type === 'AWS::Lambda::Version' &&
-          resource.Properties.FunctionName.Ref === functionCfLogicalId
-      ).Properties;
-
-      await updateConfig({
-        disabledDeprecations: ['LAMBDA_HASHING_VERSION_PROPERTY'],
-        provider: {
-          lambdaHashingVersion: '20200924',
-        },
-      });
-      const { cfTemplate: updatedTemplate } = await runServerless({
-        cwd: serviceDir,
-        command: 'package',
-      });
-      const updatedVersionCfConfig = Object.values(updatedTemplate.Resources).find(
-        (resource) =>
-          resource.Type === 'AWS::Lambda::Version' &&
-          resource.Properties.FunctionName.Ref === functionCfLogicalId
-      ).Properties;
-
-      expect(originalVersionCfConfig.CodeSha256).to.deep.equal(updatedVersionCfConfig.CodeSha256);
     });
   });
 
@@ -1762,6 +2079,10 @@ describe('lib/plugins/aws/package/compile/functions/index.test.js', () => {
               handler: 'index.handler',
               ephemeralStorageSize: 1024,
             },
+            fnRecursiveLoop: {
+              handler: 'index.handler',
+              recursiveLoop: 'Allow',
+            },
             fnLogs: {
               handler: 'target.handler',
               logs: {
@@ -1805,7 +2126,7 @@ describe('lib/plugins/aws/package/compile/functions/index.test.js', () => {
               ExternalLambdaLayer: {
                 Type: 'AWS::Lambda::LayerVersion',
                 Properties: {
-                  CompatibleRuntimes: ['nodejs18.x'],
+                  CompatibleRuntimes: ['nodejs20.x'],
                   Content: {
                     S3Bucket: 'bucket',
                     S3Key: 'key',
@@ -1934,9 +2255,9 @@ describe('lib/plugins/aws/package/compile/functions/index.test.js', () => {
       // https://github.com/serverless/serverless/blob/d8527d8b57e7e5f0b94ba704d9f53adb34298d99/lib/plugins/aws/package/compile/functions/index.test.js#L1784-L1820
     });
 
-    it('should default to "nodejs18.x" runtime`', () => {
+    it('should default to the fixture provider runtime', () => {
       const funcResource = cfResources[naming.getLambdaLogicalId('target')];
-      expect(funcResource.Properties.Runtime).to.equal('nodejs18.x');
+      expect(funcResource.Properties.Runtime).to.equal('nodejs20.x');
     });
 
     it.skip('TODO: should support `functions[].runtime`', () => {
@@ -2331,6 +2652,17 @@ describe('lib/plugins/aws/package/compile/functions/index.test.js', () => {
       expect(
         cfResources[naming.getLambdaLogicalId('fnEphemeralStorage')].Properties.EphemeralStorage
       ).to.deep.equal({ Size: ephemeralStorageSize });
+    });
+
+    it('should support `functions[].recursiveLoop`', () => {
+      expect(
+        cfResources[naming.getLambdaLogicalId('fnRecursiveLoop')].Properties.RecursiveLoop
+      ).to.equal('Allow');
+    });
+
+    it('should not set RecursiveLoop when not specified', () => {
+      expect(cfResources[naming.getLambdaLogicalId('fnEphemeralStorage')].Properties.RecursiveLoop)
+        .to.be.undefined;
     });
 
     it('should support `functions[].logs`', () => {
@@ -2797,17 +3129,10 @@ describe('lib/plugins/aws/package/compile/functions/index.test.js', () => {
   });
 
   describe('Version hash resolution', () => {
-    const testLambdaHashingVersion = (lambdaHashingVersion) => {
-      const configExt = lambdaHashingVersion
-        ? {
-            provider: { lambdaHashingVersion },
-            disabledDeprecations: ['LAMBDA_HASHING_VERSION_PROPERTY'],
-          }
-        : {};
-
+    const testLambdaHashingVersion = () => {
       it('should create a different version if configuration changed', async () => {
         const { servicePath: serviceDir, updateConfig } = await fixtures.setup('function', {
-          configExt,
+          configExt: {},
         });
 
         const { cfTemplate: originalTemplate } = await runServerless({
@@ -2844,7 +3169,7 @@ describe('lib/plugins/aws/package/compile/functions/index.test.js', () => {
 
       it('should not create a different version if only function-wide configuration changed', async () => {
         const { servicePath: serviceDir, updateConfig } = await fixtures.setup('function', {
-          configExt,
+          configExt: {},
         });
 
         const { cfTemplate: originalTemplate } = await runServerless({
@@ -2888,7 +3213,7 @@ describe('lib/plugins/aws/package/compile/functions/index.test.js', () => {
         };
 
         beforeEach(async () => {
-          const serviceData = await fixtures.setup('function-layers', { configExt });
+          const serviceData = await fixtures.setup('function-layers', { configExt: {} });
           ({ servicePath: serviceDir, updateConfig } = serviceData);
           const data = await runServerless({
             cwd: serviceDir,
@@ -3038,7 +3363,6 @@ describe('lib/plugins/aws/package/compile/functions/index.test.js', () => {
 
             await fsp.rename(originalLayer, backupLayer);
             await fsp.rename(sourceChangeLayer, originalLayer);
-            getHashForFilePath.clear();
           });
 
           afterEach(async () => {
@@ -3065,45 +3389,6 @@ describe('lib/plugins/aws/package/compile/functions/index.test.js', () => {
     };
     describe('default hashing version', () => {
       testLambdaHashingVersion();
-    });
-
-    describe('lambdaHashingVersion: 20200924', () => {
-      testLambdaHashingVersion('20200924');
-    });
-
-    describe('lambdaHashingVersion migration', () => {
-      it('should enforce new description configuration and version with `--enforce-hash-update` flag', async () => {
-        const { servicePath: serviceDir } = await fixtures.setup('function', {
-          configExt: {
-            disabledDeprecations: ['LAMBDA_HASHING_VERSION_V2'],
-            provider: {
-              lambdaHashingVersion: null,
-            },
-          },
-        });
-
-        const { cfTemplate: originalTemplate, awsNaming } = await runServerless({
-          cwd: serviceDir,
-          command: 'package',
-        });
-        const originalVersionArn =
-          originalTemplate.Outputs.BasicLambdaFunctionQualifiedArn.Value.Ref;
-
-        const { cfTemplate: updatedTemplate } = await runServerless({
-          cwd: serviceDir,
-          command: 'deploy',
-          lastLifecycleHookName: 'before:deploy:deploy',
-          options: {
-            'enforce-hash-update': true,
-          },
-        });
-        const updatedVersionArn = updatedTemplate.Outputs.BasicLambdaFunctionQualifiedArn.Value.Ref;
-
-        expect(originalVersionArn).not.to.equal(updatedVersionArn);
-        expect(
-          updatedTemplate.Resources[awsNaming.getLambdaLogicalId('basic')].Properties.Description
-        ).to.equal('temporary-description-to-enforce-hash-update');
-      });
     });
   });
 

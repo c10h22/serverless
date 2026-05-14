@@ -1,11 +1,9 @@
 'use strict';
 
-const chai = require('chai');
 const sinon = require('sinon');
 const PluginSearch = require('../../../../../lib/plugins/plugin/search');
 const Serverless = require('../../../../../lib/serverless');
 const CLI = require('../../../../../lib/classes/cli');
-chai.use(require('chai-as-promised'));
 const expect = require('chai').expect;
 
 describe('PluginSearch', () => {
@@ -59,7 +57,6 @@ describe('PluginSearch', () => {
     });
 
     it('should have a required option "query" for the "search" sub-command', () => {
-      // eslint-disable-next-line no-unused-expressions
       expect(pluginSearch.commands.plugin.commands.search.options.query.required).to.be.true;
     });
 

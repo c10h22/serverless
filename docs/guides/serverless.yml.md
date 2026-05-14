@@ -10,10 +10,10 @@ Here is a list of all available properties in `serverless.yml` when the provider
 # Service name
 service: myservice
 
-# Framework version constraint (semver constraint): '3', '^2.33'
+# osls version constraint (semver constraint): '3', '^2.33'
 frameworkVersion: '3'
 
-# Configuration validation: 'error' (fatal error), 'warn' (logged to the output) or 'off' (default: warn)
+# Configuration validation: 'error' (fatal error), 'warn' (logged to the output) or 'off' (default: error)
 # See the docs
 configValidationMode: error
 # Load environment variables from .env files (default: false)
@@ -101,7 +101,7 @@ Some function settings can be defined for all functions inside the `provider` ke
 # serverless.yml
 
 provider:
-  runtime: nodejs18.x
+  runtime: nodejs24.x
   runtimeManagement: auto # optional, set how Lambda controls all functions runtime. AWS default is auto; this can either be 'auto' or 'onFunctionUpdate'. For 'manual', see example in hello function below (syntax for both is identical
   # Default memory size for functions (default: 1024MB)
   memorySize: 512
@@ -121,23 +121,25 @@ provider:
     Name: data-protection-policy
   # KMS key ARN to use for encryption for all functions
   kmsKeyArn: arn:aws:kms:us-east-1:XXXXXX:key/some-hash
-  # Version of hashing algorithm used by Serverless Framework for function packaging
-  lambdaHashingVersion: 20201221
   # Use function versioning (enabled by default)
   versionFunctions: false
   # Processor architecture: 'x86_64' or 'arm64' via Graviton2 (default: x86_64)
   architecture: x86_64
 ```
 
+If `provider.runtime` is omitted for AWS services, osls defaults to the latest supported Node.js Lambda runtime. Today that is `nodejs24.x`.
+
+Even so, we recommend explicitly setting the runtime you want to deploy so your service does not change runtimes when that default advances.
+
 ### Deployment bucket
 
-Serverless Framework needs a S3 bucket to store artifacts for deploying. That bucket is automatically created and managed by Serverless, but you can configure it explicitly if needed:
+osls needs a S3 bucket to store artifacts for deploying. That bucket is automatically created and managed by osls, but you can configure it explicitly if needed:
 
 ```yaml
 provider:
   # The S3 prefix under which deployed artifacts are stored (default: serverless)
   deploymentPrefix: serverless
-  # Configure the S3 bucket used by Serverless Framework to deploy code packages to Lambda
+  # Configure the S3 bucket used by osls to deploy code packages to Lambda
   deploymentBucket:
     # Name of an existing bucket to use (default: created by serverless)
     name: com.serverless.${self:provider.region}.deploys
@@ -252,6 +254,13 @@ provider:
     websocketApiId: xxxx
     # Disable the default 'execute-api' HTTP endpoint (default: false)
     disableDefaultEndpoint: true
+    # Optional REST API endpoint security settings
+    endpoint:
+      # TLS security policy for the generated REST API
+      securityPolicy: SecurityPolicy_TLS13_2025_EDGE
+      # Endpoint access mode for enhanced security policies: basic or strict
+      # Use "" only to unset access mode when reverting from enhanced to legacy policies
+      accessMode: strict
     # Source of API key for usage plan: HEADER or AUTHORIZER
     apiKeySourceType: HEADER
     # List of API keys for the REST API
@@ -273,7 +282,7 @@ provider:
       - '*/*'
     # Optional detailed Cloud Watch Metrics
     metrics: false
-    # Use `${service}-${stage}` naming for API Gateway. Will be `true` by default in v3.
+    # Use `${service}-${stage}` naming for API Gateway.
     shouldStartNameWithService: false
     resourcePolicy:
       - Effect: Allow
@@ -378,6 +387,7 @@ Configure [deployment via Docker images](./functions.md#referencing-container-im
 provider:
   ecr:
     scanOnPush: true
+    maxImageCount: 10 # Max number of images to retain in ECR (enables lifecycle policy)
     # Definitions of images that later can be referenced by key in `function.image`
     images:
       baseimage:
@@ -390,15 +400,8 @@ provider:
         file: Dockerfile.dev
         buildArgs:
           STAGE: ${sls:stage}
-        buildOptions:
-          [
-            '--tag',
-            'v1.0.0',
-            '--add-host',
-            'example.com:0.0.0.0',
-            '--ssh',
-            'default=/path/to/private/key/id_rsa',
-          ]
+        # buildOptions are passed directly to `docker build`; use only with trusted service configs.
+        buildOptions: ['--pull', '--label', 'com.example.stage=${sls:stage}']
         cacheFrom:
           - my-image:latest
 ```
@@ -447,7 +450,7 @@ provider:
   iam:
     # Instruct Serverless to use an existing IAM role for all Lambda functions
     role: arn:aws:iam::XXXXXX:role/role
-    # OR configure the role that will be created by Serverless (simplest):
+    # OR configure the role that will be created by osls (simplest):
     role:
       # Add statements to the IAM role to give permissions to Lambda functions
       statements:
@@ -525,18 +528,18 @@ provider:
       applicationLogLevel: ERROR
       # The System Log Level to be used, This can only be set if `logFormat` is set to `JSON`
       systemLogLevel: INFO
-      # The LogGroup that will be used by default. If this is set the Framework will not create LogGroups for any functions
+      # The LogGroup that will be used by default. If this is set the CLI will not create LogGroups for any functions
       logGroup: /aws/lambda/global-log-group
 
     # Enable HTTP API logs
     # This can either be set to `httpApi: true` to use defaults, or configured via subproperties
-    # Can only be configured if the API is created by Serverless Framework
+    # Can only be configured if the API is created by osls
     httpApi:
       format: '{ "requestId":"$context.requestId", "ip": "$context.identity.sourceIp", "requestTime":"$context.requestTime", "httpMethod":"$context.httpMethod","routeKey":"$context.routeKey", "status":"$context.status","protocol":"$context.protocol", "responseLength":"$context.responseLength" }'
 
     # Enable REST API logs
     # This can either be set to `restApi: true` to use defaults, or configured via subproperties
-    # Can only be configured if the API is created by Serverless Framework
+    # Can only be configured if the API is created by osls
     restApi:
       # Enables HTTP access logs (default: true)
       accessLogging: true
@@ -550,7 +553,7 @@ provider:
       fullExecutionData: true
       # Existing IAM role to use for API Gateway when writing CloudWatch Logs (default: automatically created)
       role: arn:aws:iam::123456:role
-      # Whether the API Gateway CloudWatch Logs role setting is not managed by Serverless (default: false)
+      # Whether the API Gateway CloudWatch Logs role setting is not managed by osls (default: false)
       roleManagedExternally: false
 
     # Enable Websocket API logs
@@ -567,7 +570,7 @@ provider:
       # Log full requests/responses for execution logging (default: true)
       fullExecutionData: true
 
-    # Optional, whether to write CloudWatch logs for custom resource lambdas as added by the framework
+    # Optional, whether to write CloudWatch logs for custom resource lambdas as added by osls
     frameworkLambda: true
 ```
 
@@ -606,7 +609,8 @@ package:
     - '!.travis.yml'
   # Package each function as an individual artifact (default: false)
   individually: true
-  # Explicitly set the package artifact to deploy (overrides native packaging behavior)
+  # Explicitly set the package artifact to deploy (overrides native packaging behavior).
+  # Local artifact paths are trusted input and may point outside the service directory.
   artifact: path/to/my-artifact.zip
   # Automatically exclude NPM dev dependencies from the deployed package (default: true)
   excludeDevDependencies: false
@@ -627,7 +631,7 @@ functions:
     # Container image to use. Cannot be used with 'handler'.
     # Can be the URI of an image in ECR, or the name of an image defined in 'provider.ecr.images'
     image: baseimage
-    runtime: nodejs18.x
+    runtime: nodejs24.x
     runtimeManagement:
       mode: manual # syntax required for manual, mode property also supports 'auto' or 'onFunctionUpdate' (see provider.runtimeManagement)
       arn: <aws runtime arn> # required when mode is manual
@@ -656,12 +660,15 @@ functions:
     onError: arn:aws:sns:us-east-1:XXXXXX:sns-topic
     # KMS key ARN to use for encryption for this function
     kmsKeyArn: arn:aws:kms:us-east-1:XXXXXX:key/some-hash
-    # Defines if you want to make use of SnapStart, this feature can only be used in combination with a Java runtime. Configuring this property will result in either None or PublishedVersions for the Lambda function
+    # Defines if you want to make use of SnapStart on supported runtimes. Configuring this
+    # property will result in either None or PublishedVersions for the Lambda function
     snapStart: true
     # Configure AWS Lambda Durable Functions for long-running workflows (auto-enables versioning)
     durableConfig:
       executionTimeout: 3600              # Required: 1-31536000 seconds
       retentionPeriodInDays: 30           # Optional: 1-90 days
+    # Allow or Terminate recursive invocation loops between supported AWS services (default: Terminate)
+    recursiveLoop: Allow
     # Disable the creation of the CloudWatch log group
     disableLogs: false
     # Duration for CloudWatch log retention (default: forever). Overrides provider setting.
@@ -702,7 +709,8 @@ functions:
         - handler.js
         - '!.git/**'
         - '!.travis.yml'
-      # Explicitly set the package artifact to deploy (overrides native packaging behavior)
+      # Explicitly set the package artifact to deploy (overrides native packaging behavior).
+      # Local artifact paths are trusted input and may point outside the service directory.
       artifact: path/to/my-artifact.zip
       # Package this function as an individual artifact (default: false)
       individually: true
@@ -830,6 +838,9 @@ functions:
               application/json: '{ "httpMethod" : "$context.httpMethod" }'
             # Optional define pass through behavior when content-type does not match any of the specified mapping templates
             passThrough: NEVER
+          # Enable streaming responses by setting transferMode to STREAM (default is BUFFERED)
+          response:
+            transferMode: STREAM
 ```
 
 ### Websocket API
@@ -1042,7 +1053,7 @@ functions:
 
 ### Kafka
 
-[Kakfa events](../events/kafka.md):
+[Kafka events](../events/kafka.md):
 
 ```yaml
 functions:
@@ -1255,7 +1266,7 @@ functions:
           pattern:
             source:
               - saas.external
-      # Re-use an existing event bus
+      # Reuse an existing event bus
       - eventBridge:
           eventBus: arn:aws:events:us-east-1:12345:event-bus/custom-private-events
           pattern:
@@ -1355,7 +1366,7 @@ layers:
     description: Description of what the lambda layer does
     # optional, a list of runtimes this layer is compatible with
     compatibleRuntimes:
-      - python3.11
+      - python3.14
     # optional, a list of architectures this layer is compatible with
     compatibleArchitectures:
       - x86_64
@@ -1394,7 +1405,7 @@ resources:
           WriteCapacityUnits: 1
 
   extensions:
-    # override Properties or other attributes of Framework-created resources.
+    # override Properties or other attributes of osls-created resources.
     # See ./resources.md#override-aws-cloudformation-resource for more details
     UsersCreateLogGroup:
       Properties:

@@ -1,9 +1,13 @@
 {
   "name": "osls",
   "version": "3.40.1",
-  "description": "Open-source alternative to Serverless Framework",
+  "description": "osls CLI for deploying serverless applications",
   "preferGlobal": true,
-  "homepage": "https://github.com/oss-serverless/serverless",
+  "homepage": "https://github.com/oss-serverless/osls",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/oss-serverless/osls.git"
+  },
   "keywords": [
     "serverless",
     "lambda",
@@ -17,196 +21,96 @@
   "main": "lib/serverless.js",
   "types": "types/index.d.ts",
   "bin": {
-    "serverless": "./bin/serverless.js",
-    "sls": "./bin/serverless.js",
-    "osls": "./bin/serverless.js"
+    "serverless": "bin/serverless.js",
+    "sls": "bin/serverless.js",
+    "osls": "bin/serverless.js"
   },
   "dependencies": {
-    "@aws-sdk/client-api-gateway": "^3.588.0",
-    "@aws-sdk/client-apigatewayv2": "^3.588.0",
-    "@aws-sdk/client-cloudformation": "^3.588.0",
-    "@aws-sdk/client-cloudwatch": "^3.588.0",
-    "@aws-sdk/client-cloudwatch-logs": "^3.588.0",
-    "@aws-sdk/client-cognito-identity-provider": "^3.588.0",
-    "@aws-sdk/client-dynamodb": "^3.588.0",
-    "@aws-sdk/client-ecr": "^3.588.0",
-    "@aws-sdk/client-eventbridge": "^3.588.0",
-    "@aws-sdk/client-iam": "^3.588.0",
-    "@aws-sdk/client-iot": "^3.588.0",
-    "@aws-sdk/client-iot-data-plane": "^3.588.0",
-    "@aws-sdk/client-kinesis": "^3.588.0",
-    "@aws-sdk/client-lambda": "^3.588.0",
-    "@aws-sdk/client-s3": "^3.588.0",
-    "@aws-sdk/client-sns": "^3.588.0",
-    "@aws-sdk/client-sqs": "^3.588.0",
-    "@aws-sdk/client-ssm": "^3.588.0",
-    "@aws-sdk/client-sts": "^3.588.0",
-    "@aws-sdk/lib-dynamodb": "^3.588.0",
-    "@aws-sdk/lib-storage": "^3.588.0",
-    "@aws-sdk/credential-providers": "^3.588.0",
-    "@serverless/utils": "^6.13.1",
+    "@apidevtools/json-schema-ref-parser": "^15.3.5",
+    "@aws-sdk/client-api-gateway": "^3.975.0",
+    "@aws-sdk/client-apigatewayv2": "^3.975.0",
+    "@aws-sdk/client-cloudformation": "^3.975.0",
+    "@aws-sdk/client-cloudwatch": "^3.975.0",
+    "@aws-sdk/client-cloudwatch-logs": "^3.975.0",
+    "@aws-sdk/client-cognito-identity-provider": "^3.975.0",
+    "@aws-sdk/client-ecr": "^3.975.0",
+    "@aws-sdk/client-eventbridge": "^3.975.0",
+    "@aws-sdk/client-iam": "^3.975.0",
+    "@aws-sdk/client-lambda": "^3.975.0",
+    "@aws-sdk/client-s3": "^3.983.0",
+    "@aws-sdk/client-ssm": "^3.975.0",
+    "@aws-sdk/client-sts": "^3.975.0",
+    "@aws-sdk/credential-providers": "^3.975.0",
+    "@aws-sdk/lib-storage": "^3.983.0",
+    "@smithy/node-http-handler": "^4.6.1",
     "ajv": "^8.12.0",
-    "ajv-formats": "^2.1.1",
-    "archiver": "^7.0.1",
-    "aws-sdk": "^2.1692.0",
-    "bluebird": "^3.7.2",
+    "ajv-formats": "^3.0.1",
     "cachedir": "^2.3.0",
-    "chalk": "^4.1.2",
-    "child-process-ext": "^3.0.2",
-    "ci-info": "^3.9.0",
-    "cli-progress-footer": "^2.3.2",
-    "d": "^1.0.1",
+    "content-disposition": "^1.1.0",
+    "cross-spawn": "^7.0.6",
     "dayjs": "^1.11.8",
-    "decompress": "^4.2.1",
-    "dotenv": "^16.3.1",
-    "dotenv-expand": "^10.0.0",
-    "essentials": "^1.2.0",
+    "dotenv": "^17.4.2",
+    "dotenv-expand": "^13.0.0",
     "ext": "^1.7.0",
+    "fast-glob": "^3.3.3",
     "fastest-levenshtein": "^1.0.16",
-    "filesize": "^10.0.7",
-    "fs-extra": "^10.1.0",
-    "get-stdin": "^8.0.0",
-    "globby": "^11.1.0",
-    "graceful-fs": "^4.2.11",
-    "https-proxy-agent": "^5.0.1",
-    "is-docker": "^2.2.1",
+    "filenamify": "^7.0.1",
+    "https-proxy-agent": "^9.0.0",
     "js-yaml": "^4.1.0",
     "json-cycle": "^1.5.0",
-    "json-refs": "^3.0.15",
-    "lodash": "^4.17.21",
+    "log": "^6.3.1",
+    "log-node": "^8.0.3",
     "memoizee": "^0.4.15",
     "micromatch": "^4.0.5",
+    "mime-types": "^3.0.2",
     "module-alias": "^2.2.3",
-    "node-fetch": "^2.6.11",
     "object-hash": "^3.0.0",
-    "open": "^8.4.2",
-    "process-utils": "^4.0.0",
-    "promise-queue": "^2.2.5",
+    "open": "^11.0.0",
     "punycode": "^2.3.1",
     "require-from-string": "^2.0.2",
     "semver": "^7.5.3",
-    "signal-exit": "^3.0.7",
-    "strip-ansi": "^6.0.1",
-    "supports-color": "^8.1.1",
-    "timers-ext": "^0.1.7",
+    "signal-exit": "^4.1.0",
     "tsx": "^4.20.3",
     "type": "^2.7.2",
-    "untildify": "^4.0.0",
-    "uuid": "^9.0.0",
-    "ws": "^7.5.9",
-    "yaml-ast-parser": "0.0.43"
+    "undici": "^7.25.0",
+    "write-file-atomic": "^7.0.1",
+    "yauzl": "^3.3.0",
+    "yazl": "^3.3.1"
   },
   "devDependencies": {
-    "@serverless/eslint-config": "^5.1.0",
-    "@serverless/test": "^11.1.1",
+    "@eslint/js": "^10.0.1",
     "adm-zip": "^0.5.10",
     "aws4": "^1.12.0",
-    "chai": "^4.3.7",
-    "chai-as-promised": "^7.1.1",
-    "eslint": "^8.43.0",
-    "eslint-plugin-import": "^2.27.5",
+    "chai": "^6.2.2",
+    "chai-as-promised": "^8.0.2",
+    "eslint": "^10.2.1",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-import-x": "^4.16.2",
+    "eslint-plugin-n": "^17.24.0",
     "git-list-updated": "^1.2.1",
-    "husky": "^4.3.8",
+    "globals": "^17.5.0",
     "jszip": "^3.10.1",
-    "lint-staged": "^13.2.2",
-    "log": "^6.3.1",
-    "log-node": "^8.0.3",
-    "mocha": "^9.2.2",
-    "mock-require": "^3.0.3",
-    "ncjsm": "^4.3.2",
-    "pkg": "^5.8.1",
-    "prettier": "^2.8.8",
+    "mocha": "12.0.0-beta-9.2",
+    "prettier": "^3.8.3",
     "proxyquire": "^2.1.3",
-    "semver-regex": "^3.1.4",
-    "sinon": "^13.0.2",
-    "sinon-chai": "^3.7.0",
-    "standard-version": "^9.5.0"
-  },
-  "overrides": {
-    "node-fetch": {
-      "whatwg-url": "^12.0.0"
-    }
-  },
-  "eslintConfig": {
-    "extends": "@serverless/eslint-config/node/12",
-    "root": true,
-    "overrides": [
-      {
-        "files": [
-          "test/fixtures/**"
-        ],
-        "rules": {
-          "no-console": "off"
-        },
-        "globals": {
-          "awslambda": "readonly"
-        }
-      },
-      {
-        "files": [
-          "test/fixtures/programmatic/plugin/local-esm-plugin/**",
-          "test/fixtures/programmatic/plugin/node_modules/esm-plugin/**",
-          "test/fixtures/programmatic/invocation/esm/**"
-        ],
-        "parserOptions": {
-          "sourceType": "module"
-        }
-      },
-      {
-        "files": [
-          "lib/utils/import-esm.js"
-        ],
-        "parserOptions": {
-          "ecmaVersion": 2020
-        }
-      }
-    ]
-  },
-  "eslintIgnore": [
-    "!/.github",
-    "/lib/plugins/create/templates/**",
-    "/lib/plugins/aws/custom-resources/node_modules/**",
-    "!/test/fixtures/programmatic/locallyInstalledServerless/node_modules/**"
-  ],
-  "mocha": {
-    "require": [
-      "./test/mocha-patch",
-      "@serverless/test/setup/log",
-      "@serverless/test/setup/mock-homedir",
-      "@serverless/test/setup/mock-cwd",
-      "@serverless/test/setup/restore-env"
-    ],
-    "timeout": 60000
-  },
-  "lint-staged": {
-    "*.js": [
-      "eslint"
-    ],
-    "*.{css,html,js,json,md,yaml,yml}": [
-      "prettier -c"
-    ]
+    "sinon": "^21.1.2",
+    "sinon-chai": "^4.0.1",
+    "ws": "^8.20.0"
   },
   "scripts": {
-    "integration-test-cleanup": "node test/utils/aws-cleanup.js",
-    "integration-test-run-all": "mocha-isolated --pass-through-aws-creds --skip-fs-cleanup-check --max-workers=20 \"test/integration/**/*.test.js\"",
-    "integration-test-run-basic": "mocha test/integration-basic.test.js",
-    "integration-test-run-package": "mocha-isolated --skip-fs-cleanup-check test/integration-package/**/*.tests.js",
-    "integration-test-setup": "node ./scripts/test/integration-setup/index.js",
-    "integration-test-teardown": "node ./scripts/test/integration-teardown.js",
+    "integration-test-run-package": "mocha --config test/mocha/package.cjs \"test/integration-package/**/*.tests.js\"",
     "lint": "eslint .",
-    "lint:updated": "pipe-git-updated --ext=js --base=main -- eslint",
-    "pkg:build": "node ./scripts/pkg/build.js",
-    "pkg:upload": "node ./scripts/pkg/upload/index.js",
-    "prettier-check": "prettier -c \"**/*.{css,html,js,json,md,yaml,yml}\"",
-    "prettier-check:updated": "pipe-git-updated --ext=css --ext=html --ext=js --ext=json --ext=md --ext=yaml --ext=yml --base=main -- prettier -c",
-    "prettify": "prettier --write \"**/*.{css,html,js,json,md,yaml,yml}\"",
-    "prettify:updated": "pipe-git-updated --ext=css --ext=html --ext=js --ext=json --ext=md --ext=yaml --ext=yml --base=main -- prettier --write",
-    "test": "mocha \"test/unit/**/*.test.js\"",
+    "lint:updated": "pipe-git-updated --ext=cjs --ext=js --ext=mjs --base=main -- eslint",
+    "prettier-check": "prettier -c \"**/*.{cjs,css,html,js,json,md,mjs,yaml,yml}\"",
+    "prettier-check:updated": "pipe-git-updated --ext=cjs --ext=css --ext=html --ext=js --ext=json --ext=md --ext=mjs --ext=yaml --ext=yml --base=main -- prettier -c",
+    "prettify": "prettier --write \"**/*.{cjs,css,html,js,json,md,mjs,yaml,yml}\"",
+    "prettify:updated": "pipe-git-updated --ext=cjs --ext=css --ext=html --ext=js --ext=json --ext=md --ext=mjs --ext=yaml --ext=yml --base=main -- prettier --write",
+    "test": "mocha --config test/mocha/unit.cjs --parallel \"test/unit/**/*.test.js\"",
     "test:ci": "npm run prettier-check:updated && npm run lint:updated && npm run test:isolated",
-    "test:isolated": "mocha-isolated \"test/unit/**/*.test.js\""
+    "test:isolated": "mocha --config test/mocha/unit.cjs --parallel \"test/unit/**/*.test.js\""
   },
   "engines": {
-    "node": ">=12.0"
+    "node": "^20.19.0 || ^22.13.0 || >=24"
   },
   "license": "MIT"
 }

@@ -1,11 +1,9 @@
 'use strict';
 
 const chai = require('chai');
-const overrideEnv = require('process-utils/override-env');
+const { overrideEnv } = require('../../../utils/process');
 const Invoke = require('../../../../lib/plugins/invoke');
 const Serverless = require('../../../../lib/serverless');
-
-chai.use(require('chai-as-promised'));
 
 const expect = chai.expect;
 

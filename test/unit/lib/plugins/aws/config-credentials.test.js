@@ -5,15 +5,14 @@ const sandbox = require('sinon');
 const { constants } = require('fs');
 const fs = require('fs');
 const fsp = require('fs').promises;
-const fse = require('fs-extra');
 const os = require('os');
 const path = require('path');
 const AwsConfigCredentials = require('../../../../../lib/plugins/aws/config-credentials');
 const Serverless = require('../../../../../lib/serverless');
 const runServerless = require('../../../../utils/run-serverless');
+const { outputFile, outputFileSync, remove } = require('../../../../utils/fs');
 
 const { expect } = chai;
-chai.use(require('chai-as-promised'));
 
 describe('AwsConfigCredentials', () => {
   let awsConfigCredentials;
@@ -53,7 +52,7 @@ describe('AwsConfigCredentials', () => {
     });
   });
 
-  afterEach(() => fse.remove(awsDirectoryPath));
+  afterEach(() => remove(awsDirectoryPath));
 
   describe('#constructor()', () => {
     it('should have the command "config"', () => {
@@ -75,10 +74,8 @@ describe('AwsConfigCredentials', () => {
     });
 
     it('should have the req. options "key" and "secret" for the "credentials" sub-command', () => {
-      // eslint-disable-next-line no-unused-expressions
       expect(awsConfigCredentials.commands.config.commands.credentials.options.key.required).to.be
         .true;
-      // eslint-disable-next-line no-unused-expressions
       expect(awsConfigCredentials.commands.config.commands.credentials.options.secret.required).to
         .be.true;
     });
@@ -147,7 +144,7 @@ describe('AwsConfigCredentials', () => {
       awsConfigCredentials.options.secret = 'my-new-profile-secret';
       awsConfigCredentials.options.overwrite = true;
 
-      fse.outputFileSync(credentialsFilePath, credentialsFileContent);
+      outputFileSync(credentialsFilePath, credentialsFileContent);
 
       return awsConfigCredentials.configureCredentials().then(() => {
         const UpdatedCredentialsFileContent = fs.readFileSync(credentialsFilePath).toString();
@@ -172,7 +169,7 @@ describe('AwsConfigCredentials', () => {
         'aws_secret_access_key = my-other-profile-secret',
       ].join('\n');
 
-      fse.outputFileSync(credentialsFilePath, newCredentialsFileContent);
+      outputFileSync(credentialsFilePath, newCredentialsFileContent);
 
       return awsConfigCredentials.configureCredentials().then(() => {
         const UpdatedCredentialsFileContent = fs.readFileSync(credentialsFilePath).toString();
@@ -197,7 +194,7 @@ describe('AwsConfigCredentials', () => {
       awsConfigCredentials.options.secret = 'my-new-profile-secret';
       awsConfigCredentials.options.overwrite = true;
 
-      fse.outputFileSync(credentialsFilePath, newCredentialsFileContent);
+      outputFileSync(credentialsFilePath, newCredentialsFileContent);
 
       return awsConfigCredentials.configureCredentials().then(() => {
         const UpdatedCredentialsFileContent = fs.readFileSync(credentialsFilePath).toString();
@@ -249,7 +246,7 @@ describe('test/unit/lib/plugins/aws/configCredentials.test.js', () => {
       'aws_secret_access_key = my-old-profile-secret',
     ].join('\n');
 
-    await fse.outputFile(credentialsFilePath, credentialsFileContent);
+    await outputFile(credentialsFilePath, credentialsFileContent);
 
     await expect(
       runServerless({

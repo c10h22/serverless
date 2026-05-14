@@ -2,7 +2,7 @@
 
 ## Valid Triggers
 
-Serverless supports all Cognito User Pool Triggers as specified [here][aws-triggers-list]. Use [this guide][aws-triggers-guide] to understand
+osls supports all Cognito User Pool Triggers as specified [here][aws-triggers-list]. Use [this guide][aws-triggers-guide] to understand
 the event objects that will be passed to your function.
 
 ## Simple event definition
@@ -130,13 +130,15 @@ For custom senders, the `event.triggerSource` type does not get populated by the
 
 ```js
 // customSender.js
-function handler(event, context, callback) {
+async function handler(event) {
   if (event.request.type === 'customEmailSenderRequestV1') {
     // ...
   }
   if (event.request.type === 'customSMSSenderRequestV1') {
     // ...
   }
+
+  return event;
 }
 ```
 
@@ -185,13 +187,15 @@ For custom messages, you will need to check `event.triggerSource` type inside yo
 
 ```js
 // customMessage.js
-function handler(event, context, callback) {
+async function handler(event) {
   if (event.triggerSource === 'CustomMessage_AdminCreateUser') {
     // ...
   }
   if (event.triggerSource === 'CustomMessage_ResendCode') {
     // ...
   }
+
+  return event;
 }
 ```
 

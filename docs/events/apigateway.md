@@ -24,6 +24,7 @@ Summary:
   - [Catching Exceptions In Your Lambda Function](#catching-exceptions-in-your-lambda-function)
   - [Setting API keys for your Rest API](#setting-api-keys-for-your-rest-api)
   - [Configuring endpoint types](#configuring-endpoint-types)
+  - [Security Policy](#security-policy)
   - [Request Parameters](#request-parameters)
   - [Request Schema Validators](#request-schema-validators)
   - [Setting source of API key for metering requests](#setting-source-of-api-key-for-metering-requests)
@@ -66,7 +67,7 @@ _Are you looking for tutorials on using API Gateway? Check out the following res
 > - [Create a Node REST API with Express.js](https://serverless.com/blog/serverless-express-rest-api/)
 > - [Make a Serverless GraphQL API](https://serverless.com/blog/make-serverless-graphql-api-using-lambda-dynamodb/)
 
-To create HTTP endpoints as Event sources for your AWS Lambda Functions, use the Serverless Framework's easy AWS API Gateway Events syntax.
+To create HTTP endpoints as Event sources for your AWS Lambda Functions, use the osls AWS API Gateway Events syntax.
 
 There are five ways you can configure your HTTP endpoints to integrate with your AWS Lambda Functions:
 
@@ -76,7 +77,7 @@ There are five ways you can configure your HTTP endpoints to integrate with your
 - `http-proxy` / `http_proxy`
 - `mock`
 
-**The Framework uses the `lambda-proxy` method (i.e., everything is passed into your Lambda) by default unless another method is supplied by the user**
+**The CLI uses the `lambda-proxy` method (i.e., everything is passed into your Lambda) by default unless another method is supplied by the user**
 
 The difference between these is `lambda-proxy` (alternative writing styles are `aws-proxy` and `aws_proxy` for compatibility with the standard AWS integration type naming) automatically passes the content of the HTTP request into your AWS Lambda function (headers, body, etc.) and allows you to configure your response (headers, status code, body) in the code of your AWS Lambda Function. Whereas, the `lambda` method makes you explicitly define headers, status codes, and more in the configuration of each API Gateway Endpoint (not in code). We highly recommend using the `lambda-proxy` method if it supports your use-case, since the `lambda` method is highly tedious.
 
@@ -106,18 +107,16 @@ functions:
 
 'use strict';
 
-module.exports.hello = function (event, context, callback) {
+module.exports.hello = async (event) => {
   console.log(event); // Contains incoming request data (e.g., query params, headers and more)
 
-  const response = {
+  return {
     statusCode: 200,
     headers: {
       'x-custom-header': 'My Header Value',
     },
     body: JSON.stringify({ message: 'Hello World!' }),
   };
-
-  callback(null, response);
 };
 ```
 
@@ -331,7 +330,7 @@ functions:
               - X-Amz-User-Agent
               - X-Amzn-Trace-Id
             allowCredentials: false
-            # Caches on browser and proxy for 10 minutes and doesnt allow proxy to serve out of date content
+            # Caches on browser and proxy for 10 minutes and doesn't allow proxy to serve out of date content
             cacheControl: 'max-age=600, s-maxage=600, proxy-revalidate'
 ```
 
@@ -356,8 +355,8 @@ If you want to use CORS with the lambda-proxy integration, remember to include t
 
 'use strict';
 
-module.exports.hello = function (event, context, callback) {
-  const response = {
+module.exports.hello = async () => {
+  return {
     statusCode: 200,
     headers: {
       // Required for CORS support to work
@@ -367,8 +366,6 @@ module.exports.hello = function (event, context, callback) {
     },
     body: JSON.stringify({ message: 'Hello World!' }),
   };
-
-  callback(null, response);
 };
 ```
 
@@ -609,6 +606,23 @@ functions:
           async: true # default is false
 ```
 
+### Enabling response streaming
+
+Enable response streaming for proxy integrations by setting `response.transferMode` on your `http` event:
+
+```yml
+functions:
+  stream:
+    handler: handler.stream
+    events:
+      - http:
+          path: stream
+          method: get
+          # Proxy integrations only (AWS_PROXY / HTTP_PROXY)
+          response:
+            transferMode: STREAM # defaults to BUFFERED
+```
+
 ### Catching Exceptions In Your Lambda Function
 
 In case an exception is thrown in your lambda function AWS will send an error message with `Process exited before completing request`. This will be caught by the regular expression for the 500 HTTP status and the 500 status will be returned.
@@ -704,7 +718,7 @@ functions:
 
 API Gateway [supports regional endpoints](https://aws.amazon.com/about-aws/whats-new/2017/11/amazon-api-gateway-supports-regional-api-endpoints/) for associating your API Gateway REST APIs with a particular region. This can reduce latency if your requests originate from the same region as your REST API and can be helpful in building multi-region applications.
 
-By default, the Serverless Framework deploys your REST API using the EDGE endpoint configuration. If you would like to use the REGIONAL or PRIVATE configuration, set the `endpointType` parameter in your `provider` block.
+By default, osls deploys your REST API using the EDGE endpoint configuration. If you would like to use the REGIONAL or PRIVATE configuration, set the `endpointType` parameter in your `provider` block.
 
 Here's an example configuration for setting the endpoint configuration for your service Rest API:
 
@@ -738,6 +752,66 @@ provider:
     - vpce-123
     - vpce-456
 ```
+
+### Security Policy
+
+You can configure the TLS security policy for the generated API Gateway REST API by setting `provider.apiGateway.endpoint.securityPolicy`. This maps to the [`SecurityPolicy`](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-resource-apigateway-restapi.html#cfn-apigateway-restapi-securitypolicy) property of the `AWS::ApiGateway::RestApi` CloudFormation resource.
+
+This applies only to REST APIs generated from `http` events. It does not apply to HTTP APIs generated from `httpApi` events, and it does not apply when you import an external REST API with `provider.apiGateway.restApiId`.
+
+For the default edge-optimized REST API endpoint, use an edge-compatible policy:
+
+```yml
+provider:
+  name: aws
+  apiGateway:
+    endpoint:
+      securityPolicy: SecurityPolicy_TLS13_2025_EDGE
+      accessMode: strict
+functions:
+  hello:
+    events:
+      - http:
+          path: user/create
+          method: get
+```
+
+For Regional or private REST APIs, set `provider.endpointType` and use a policy supported by that endpoint type:
+
+```yml
+provider:
+  name: aws
+  endpointType: REGIONAL
+  apiGateway:
+    endpoint:
+      securityPolicy: SecurityPolicy_TLS13_1_3_2025_09
+      accessMode: basic
+functions:
+  hello:
+    events:
+      - http:
+          path: user/create
+          method: get
+```
+
+AWS treats policies that start with `SecurityPolicy_` as enhanced security policies. When using an enhanced policy, you must also set `provider.apiGateway.endpoint.accessMode` to `basic` or `strict`.
+
+`strict` adds additional host and endpoint-type checks. AWS recommends migrating by first using `basic`, validating traffic, and then switching to `strict`.
+
+When changing an API from an enhanced policy back to a legacy policy, AWS requires endpoint access mode to be unset with an empty string:
+
+```yml
+provider:
+  name: aws
+  apiGateway:
+    endpoint:
+      securityPolicy: TLS_1_0
+      accessMode: ''
+```
+
+For normal legacy policy usage, omit `accessMode`.
+
+Supported security policies differ by endpoint type. See the [AWS supported security policies documentation](https://docs.aws.amazon.com/apigateway/latest/developerguide/apigateway-security-policies-list.html) for the current policy list.
 
 ### Request Parameters
 
@@ -983,7 +1057,7 @@ This method is more complicated and involves a lot more configuration of the `ht
 
 #### Default Request Templates
 
-Serverless ships with the following default request templates you can use out of the box:
+osls ships with the following default request templates you can use out of the box:
 
 1. `application/json`
 2. `application/x-www-form-urlencoded`
@@ -1097,7 +1171,7 @@ See the [api gateway documentation](https://docs.aws.amazon.com/apigateway/lates
 
 ### Responses
 
-Serverless lets you setup custom headers and a response template for your `http` event.
+osls lets you setup custom headers and a response template for your `http` event.
 
 #### Custom Response Headers
 
@@ -1147,15 +1221,17 @@ the `${file(templatefile)}` syntax.
 
 ### Status Codes
 
-Serverless ships with default status codes you can use to e.g. signal that a resource could not be found (404) or that
+osls ships with default status codes you can use to e.g. signal that a resource could not be found (404) or that
 the user is not authorized to perform the action (401). Those status codes are regex definitions that will be added to your API Gateway configuration.
 
-**_Note:_** Status codes as documented in this chapter relate to `lambda` integration method (as documented at the top of this page). If using default integration method `lambda-proxy` object with status code and message should be returned as in the example below:
+**_Note:_** Status codes as documented in this chapter relate to `lambda` integration method (as documented at the top of this page). If using default integration method `lambda-proxy`, return an object with the status code and message as in the example below:
 
 ```javascript
-module.exports.hello = (event, context, callback) => {
-  callback(null, { statusCode: 404, body: 'Not found', headers: { 'Content-Type': 'text/plain' } });
-};
+module.exports.hello = async () => ({
+  statusCode: 404,
+  body: 'Not found',
+  headers: { 'Content-Type': 'text/plain' },
+});
 ```
 
 #### Available Status Codes
@@ -1173,20 +1249,19 @@ module.exports.hello = (event, context, callback) => {
 
 #### Using Status Codes
 
-To return a given status code you simply need to add square brackets with the status code of your choice to your
-returned message like this: `[401] You are not authorized to access this resource!`.
+To return a given status code with `lambda` integration, add square brackets with the status code of your choice to the error message like this: `[401] You are not authorized to access this resource!`.
 
-Here's an example which shows you how you can raise a 404 HTTP status from within your lambda function.
+Here's an example which shows you how you can raise a 404 HTTP status from within your Lambda function.
 
 ```javascript
-module.exports.hello = (event, context, callback) => {
-  callback(new Error('[404] Not found'));
+module.exports.hello = async () => {
+  throw new Error('[404] Not found');
 };
 ```
 
 #### Custom Status Codes
 
-You can override the defaults status codes supplied by Serverless. You can use this to change the default status code, add/remove status codes, or change the templates and headers used for each status code. Use the pattern key to change the selection process that dictates what code is returned.
+You can override the defaults status codes supplied by osls. You can use this to change the default status code, add/remove status codes, or change the templates and headers used for each status code. Use the pattern key to change the selection process that dictates what code is returned.
 
 If you specify a status code with a pattern of '' that will become the default response code. See below on how to change the default to 201 for post requests.
 
@@ -1340,9 +1415,9 @@ service: service-name
 provider:
   name: aws
   apiGateway:
-    restApiId: xxxxxxxxxx # REST API resource ID. Default is generated by the framework
+    restApiId: xxxxxxxxxx # REST API resource ID. Default is generated by osls
     restApiRootResourceId: xxxxxxxxxx # Root resource, represent as / path
-    websocketApiId: xxxxxxxxxx # Websocket API resource ID. Default is generated by the framework
+    websocketApiId: xxxxxxxxxx # Websocket API resource ID. Default is generated by osls
     description: Some Description # optional - description of deployment history
 
 functions: ...
@@ -1416,7 +1491,7 @@ provider:
 functions: ...
 ```
 
-You can define more than one path resource, but by default, Serverless will generate them from the root resource.
+You can define more than one path resource, but by default, osls will generate them from the root resource.
 `restApiRootResourceId` is optional if a path resource isn't required for the root (`/`).
 
 ```yml
@@ -1456,7 +1531,7 @@ service: my-api
 
 provider:
   name: aws
-  runtime: nodejs18.x
+  runtime: nodejs24.x
   stage: dev
   region: eu-west-2
 
@@ -1645,7 +1720,7 @@ Resource policies are policy documents that are used to control the invocation o
 ```yml
 provider:
   name: aws
-  runtime: nodejs18.x
+  runtime: nodejs24.x
 
   apiGateway:
     resourcePolicy:
@@ -1764,8 +1839,8 @@ The log streams will be generated in a dedicated log group which follows the nam
 
 To be able to write logs, API Gateway [needs a CloudWatch role configured](https://docs.aws.amazon.com/apigateway/latest/developerguide/set-up-logging.html). This setting is per region, shared by all the APIs. There are three approaches for handling it:
 
-- Let Serverless create and assign an IAM role for you (default behavior). Note that since this is a shared setting, this role is not removed when you remove the deployment.
-- Let Serverless assign an existing IAM role that you created before the deployment, if not already assigned:
+- Let osls create and assign an IAM role for you (default behavior). Note that since this is a shared setting, this role is not removed when you remove the deployment.
+- Let osls assign an existing IAM role that you created before the deployment, if not already assigned:
 
   ```yml
   # serverless.yml
@@ -1775,16 +1850,16 @@ To be able to write logs, API Gateway [needs a CloudWatch role configured](https
         role: arn:aws:iam::123456:role
   ```
 
-- Do not let Serverless manage the CloudWatch role configuration. In this case, you would create and assign the IAM role yourself, e.g. in a separate "account setup" deployment:
+- Do not let osls manage the CloudWatch role configuration. In this case, you would create and assign the IAM role yourself, e.g. in a separate "account setup" deployment:
 
   ```yml
   provider:
     logs:
       restApi:
-        roleManagedExternally: true # disables automatic role creation/checks done by Serverless
+        roleManagedExternally: true # disables automatic role creation/checks done by osls
   ```
 
-**Note:** Serverless configures the API Gateway CloudWatch role setting using a custom resource lambda function. If you're using `iam.deploymentRole` to specify a limited-access IAM role for your serverless deployment, the custom resource lambda will assume this role during execution.
+**Note:** osls configures the API Gateway CloudWatch role setting using a custom resource lambda function. If you're using `iam.deploymentRole` to specify a limited-access IAM role for your serverless deployment, the custom resource lambda will assume this role during execution.
 
 By default, API Gateway access logs will use the following format:
 

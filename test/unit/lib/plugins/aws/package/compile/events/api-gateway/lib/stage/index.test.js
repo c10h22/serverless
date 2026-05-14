@@ -2,14 +2,16 @@
 
 const expect = require('chai').expect;
 const sinon = require('sinon');
-const BbPromise = require('bluebird');
-const _ = require('lodash');
-const childProcess = BbPromise.promisifyAll(require('child_process'));
+const childProcess = require('child_process');
+const { promisify } = require('util');
+const isObject = require('type/object/is');
 const AwsCompileApigEvents = require('../../../../../../../../../../../lib/plugins/aws/package/compile/events/api-gateway');
 const Serverless = require('../../../../../../../../../../../lib/serverless');
 const AwsProvider = require('../../../../../../../../../../../lib/plugins/aws/provider');
 const { createTmpDir } = require('../../../../../../../../../../utils/fs');
 const runServerless = require('../../../../../../../../../../utils/run-serverless');
+
+if (!childProcess.execAsync) childProcess.execAsync = promisify(childProcess.exec);
 
 describe('#compileStage()', () => {
   let serverless;
@@ -92,7 +94,6 @@ describe('#compileStage()', () => {
         const resources =
           awsCompileApigEvents.serverless.service.provider.compiledCloudFormationTemplate.Resources;
 
-        // eslint-disable-next-line
         expect(resources[stageLogicalId]).not.to.exist;
 
         expect(resources[awsCompileApigEvents.apiGatewayDeploymentLogicalId]).to.deep.equal({
@@ -200,9 +201,8 @@ describe('#compileStage()', () => {
   });
 
   describe('logs', () => {
-    before(() => sinon.stub(childProcess, 'execAsync'));
-    after(() => childProcess.execAsync.restore());
     beforeEach(() => {
+      sinon.stub(childProcess, 'execAsync');
       // setting up API Gateway logs
       awsCompileApigEvents.serverless.service.provider.logs = {
         restApi: true,
@@ -238,7 +238,6 @@ describe('#compileStage()', () => {
               DestinationArn: {
                 'Fn::GetAtt': [logGroupLogicalId, 'Arn'],
               },
-              // eslint-disable-next-line
               Format:
                 'requestId: $context.requestId, ip: $context.identity.sourceIp, caller: $context.identity.caller, user: $context.identity.user, requestTime: $context.requestTime, httpMethod: $context.httpMethod, resourcePath: $context.resourcePath, status: $context.status, protocol: $context.protocol, responseLength: $context.responseLength',
             },
@@ -287,7 +286,7 @@ describe('#compileStage()', () => {
           awsCompileApigEvents.serverless.service.provider.compiledCloudFormationTemplate.Resources;
 
         expect(
-          _.isObject(
+          isObject(
             resources[
               awsCompileApigEvents.provider.naming.getCustomResourceApiGatewayAccountCloudWatchRoleResourceLogicalId()
             ]
@@ -306,7 +305,7 @@ describe('#compileStage()', () => {
           awsCompileApigEvents.serverless.service.provider.compiledCloudFormationTemplate.Resources;
 
         expect(
-          _.isObject(
+          isObject(
             resources[
               awsCompileApigEvents.provider.naming.getCustomResourceApiGatewayAccountCloudWatchRoleResourceLogicalId()
             ]

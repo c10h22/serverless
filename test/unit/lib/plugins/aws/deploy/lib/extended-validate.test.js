@@ -8,9 +8,6 @@ const AwsDeploy = require('../../../../../../../lib/plugins/aws/deploy/index');
 const Serverless = require('../../../../../../../lib/serverless');
 const { getTmpDirPath } = require('../../../../../../utils/fs');
 
-chai.use(require('sinon-chai'));
-chai.use(require('chai-as-promised'));
-
 const expect = chai.expect;
 
 describe('extendedValidate', () => {
@@ -162,6 +159,36 @@ describe('extendedValidate', () => {
       awsDeploy.serverless.service.package.artifact = 'some/file.zip';
       await awsDeploy.extendedValidate();
       delete awsDeploy.serverless.service.package.artifact;
+    });
+
+    it('restores persisted service state without mutating the service prototype', async () => {
+      const restoredService = JSON.parse(JSON.stringify(serverlessYml));
+      restoredService.functions = {};
+      Object.defineProperty(restoredService, '__proto__', {
+        value: { polluted: true },
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+
+      const originalPrototype = Object.getPrototypeOf(awsDeploy.serverless.service);
+
+      fileExistsSyncStub.returns(true);
+      readFileSyncStub.returns({
+        service: restoredService,
+        package: {
+          individually: true,
+          artifactDirectoryName: 'some/path',
+          artifact: '',
+        },
+      });
+
+      await awsDeploy.extendedValidate();
+
+      expect(Object.getPrototypeOf(awsDeploy.serverless.service)).to.equal(originalPrototype);
+      expect(
+        Object.getOwnPropertyDescriptor(awsDeploy.serverless.service, '__proto__').value
+      ).to.deep.equal({ polluted: true });
     });
   });
 });

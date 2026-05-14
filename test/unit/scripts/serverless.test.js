@@ -4,8 +4,8 @@ const { expect } = require('chai');
 
 const path = require('path');
 const fsp = require('fs').promises;
-const spawn = require('child-process-ext/spawn');
-const stripAnsi = require('strip-ansi');
+const spawn = require('../../../lib/utils/spawn');
+const { stripVTControlCharacters: stripAnsi } = require('node:util');
 const { version } = require('../../../package');
 const programmaticFixturesEngine = require('../../fixtures/programmatic');
 
@@ -113,6 +113,18 @@ describe('test/unit/scripts/serverless.test.js', () => {
     ).to.include('looks: good');
   });
 
+  it('should reject invalid CLI stage', async () => {
+    try {
+      await spawn('node', [serverlessPath, 'print', '--stage', 'foo/../../tmp/x'], {
+        cwd: path.resolve(programmaticFixturesPath, 'aws'),
+      });
+      throw new Error('Unexpected');
+    } catch (error) {
+      expect(error.code).to.equal(1);
+      expect(String(error.stdoutBuffer)).to.include('Invalid stage name');
+    }
+  });
+
   it('should support "-c" flag for "aws-service" commands', async () => {
     try {
       await spawn('node', [serverlessPath, 'info', '-c', 'serverless.custom.yml'], {
@@ -169,9 +181,11 @@ describe('test/unit/scripts/serverless.test.js', () => {
       },
     });
     await fsp.writeFile(path.resolve(serviceDir, '.env'), 'DEFAULT_ENV_VARIABLE=valuefromdefault');
-    expect(
-      String((await spawn('node', [serverlessPath, 'print'], { cwd: serviceDir })).stdoutBuffer)
-    ).to.include('fromDefaultEnv: valuefromdefault');
+    const printOut = String(
+      (await spawn('node', [serverlessPath, 'print'], { cwd: serviceDir })).stdoutBuffer
+    );
+    expect(printOut).to.include('fromDefaultEnv: valuefromdefault');
+    expect(printOut).to.not.match(/(?:injecting|injected) env \(\d+\) from \.env/);
   });
 
   it('should allow not defined environment variables in provider.stage`', async () => {
@@ -276,6 +290,74 @@ describe('test/unit/scripts/serverless.test.js', () => {
     const output = String((await spawn('node', [serverlessPath, 'deploy', '--help'])).stdoutBuffer);
     expect(output).to.include('deploy');
     expect(output).to.include('stage');
+  });
+
+  it('should include plugin commands in service help output', async () => {
+    const { servicePath: serviceDir } = await programmaticFixturesEngine.setup('plugin');
+
+    const output = stripAnsi(
+      String(
+        (
+          await spawn('node', [serverlessPath, '--help'], {
+            cwd: serviceDir,
+          })
+        ).stdoutBuffer
+      )
+    );
+
+    expect(output).to.include('TestPlugin');
+    expect(output).to.include('customCommand');
+    expect(output).to.include('Description of custom command');
+  });
+
+  it('should print plugin command help to stdout', async () => {
+    const { servicePath: serviceDir } = await programmaticFixturesEngine.setup('plugin');
+
+    const output = stripAnsi(
+      String(
+        (
+          await spawn('node', [serverlessPath, 'customCommand', '--help'], {
+            cwd: serviceDir,
+          })
+        ).stdoutBuffer
+      )
+    );
+
+    expect(output).to.include('customCommand');
+    expect(output).to.include('Description of custom command');
+    expect(output).to.include('pluginOption');
+  });
+
+  it('should dispatch plugin command', async () => {
+    const { servicePath: serviceDir } = await programmaticFixturesEngine.setup('plugin');
+
+    const output = stripAnsi(
+      String(
+        (
+          await spawn('node', [serverlessPath, 'customCommand'], {
+            cwd: serviceDir,
+          })
+        ).stdoutBuffer
+      )
+    );
+
+    expect(output).to.include('customCommand invoked');
+  });
+
+  it('should parse plugin command options from final plugin schema', async () => {
+    const { servicePath: serviceDir } = await programmaticFixturesEngine.setup('plugin');
+
+    const output = stripAnsi(
+      String(
+        (
+          await spawn('node', [serverlessPath, 'customCommand', '--pluginOption', 'abc'], {
+            cwd: serviceDir,
+          })
+        ).stdoutBuffer
+      )
+    );
+
+    expect(output).to.include('customCommand invoked abc');
   });
 
   it('should print not integrated command --help to stdout', async () => {

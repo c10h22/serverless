@@ -2,13 +2,10 @@
 
 const runServerless = require('../../../../../../../utils/run-serverless');
 const ServerlessError = require('../../../../../../../../lib/serverless-error');
-const { use: chaiUse, expect } = require('chai');
-const chaiAsPromised = require('chai-as-promised');
+const { expect } = require('chai');
 
 const METHOD_SCHEDULER = 'scheduler';
 const METHOD_EVENT_BUS = 'eventBus';
-
-chaiUse(chaiAsPromised);
 
 async function run(events, options = {}) {
   const params = {
@@ -434,5 +431,26 @@ describe('test/unit/lib/plugins/aws/package/compile/events/schedule.test.js', ()
     expect(scheduleCfResources[0].Properties.Target.RoleArn).to.deep.equal({
       'Fn::GetAtt': ['customRole', 'Arn'],
     });
+  });
+
+  it('should pass explicit schedule roleArn to method:schedule resources', async () => {
+    const events = [
+      {
+        schedule: {
+          rate: 'rate(15 minutes)',
+          method: METHOD_SCHEDULER,
+          roleArn: 'arn:aws:iam::123456789012:role/scheduler-execution-role',
+          name: 'scheduler-scheduled-event',
+          description: 'Scheduler Scheduled Event',
+          input: '{"key":"array"}',
+        },
+      },
+    ];
+
+    const { scheduleCfResources } = await run(events, { functionRole: 'customRole' });
+
+    expect(scheduleCfResources[0].Properties.Target.RoleArn).to.equal(
+      'arn:aws:iam::123456789012:role/scheduler-execution-role'
+    );
   });
 });

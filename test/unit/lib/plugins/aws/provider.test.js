@@ -1,24 +1,25 @@
 'use strict';
 
-/* eslint-disable no-unused-expressions */
-
-const _ = require('lodash');
 const chai = require('chai');
 const path = require('path');
-const fs = require('fs-extra');
-const os = require('os');
+const fs = require('fs');
 const proxyquire = require('proxyquire');
 const sinon = require('sinon');
-const overrideEnv = require('process-utils/override-env');
+const { overrideEnv } = require('../../../../utils/process');
 
 const AwsProvider = require('../../../../../lib/plugins/aws/provider');
 const Serverless = require('../../../../../lib/serverless');
+const ServerlessError = require('../../../../../lib/serverless-error');
 const runServerless = require('../../../../utils/run-serverless');
-
-chai.use(require('chai-as-promised'));
-chai.use(require('sinon-chai'));
+const {
+  CloudFormationClient,
+  DescribeStackResourceCommand,
+  ListStackResourcesCommand,
+} = require('@aws-sdk/client-cloudformation');
+const { STSClient, GetCallerIdentityCommand } = require('@aws-sdk/client-sts');
 
 const expect = chai.expect;
+const spawnModulePath = path.resolve(__dirname, '../../../../../lib/utils/spawn.js');
 
 describe('AwsProvider', () => {
   let awsProvider;
@@ -35,7 +36,145 @@ describe('AwsProvider', () => {
     serverless.cli = new serverless.classes.CLI();
     awsProvider = new AwsProvider(serverless, options);
   });
-  afterEach(() => restoreEnv());
+  afterEach(() => {
+    if (CloudFormationClient.prototype.send.restore) {
+      CloudFormationClient.prototype.send.restore();
+    }
+    restoreEnv();
+  });
+
+  describe('#getRuntime()', () => {
+    it('should default to "nodejs24.x" when no runtime is configured', () => {
+      expect(awsProvider.getRuntime()).to.equal('nodejs24.x');
+    });
+
+    it('should use provider.runtime when no explicit runtime is passed', () => {
+      serverless.service.provider.runtime = 'nodejs22.x';
+
+      expect(awsProvider.getRuntime()).to.equal('nodejs22.x');
+    });
+
+    it('should prefer an explicit runtime argument over provider.runtime', () => {
+      serverless.service.provider.runtime = 'nodejs22.x';
+
+      expect(awsProvider.getRuntime('python3.13')).to.equal('python3.13');
+    });
+  });
+
+  describe('#resolveFunctionRuntimeManagement()', () => {
+    it('should default runtime management to auto', () => {
+      expect(awsProvider.resolveFunctionRuntimeManagement()).to.deep.equal({
+        mode: 'auto',
+      });
+    });
+
+    it('should merge provider and function runtime management with function precedence', () => {
+      serverless.service.provider.runtimeManagement = 'manual';
+
+      expect(awsProvider.resolveFunctionRuntimeManagement({ mode: 'auto' })).to.deep.equal({
+        mode: 'auto',
+      });
+    });
+  });
+
+  describe('#getCustomDeploymentRole()', () => {
+    it('should use provider.iam.deploymentRole', () => {
+      serverless.service.provider.iam = {
+        deploymentRole: 'arn:aws:iam::123:role/deploy',
+      };
+
+      expect(awsProvider.getCustomDeploymentRole()).to.equal('arn:aws:iam::123:role/deploy');
+    });
+
+    it('should not fall back to removed cfnRole', () => {
+      serverless.service.provider.iam = {};
+
+      expect(awsProvider.getCustomDeploymentRole()).to.equal(undefined);
+    });
+
+    it('should preserve an explicit null deployment role', () => {
+      serverless.service.provider.iam = {
+        deploymentRole: null,
+      };
+
+      expect(awsProvider.getCustomDeploymentRole()).to.equal(null);
+    });
+  });
+
+  describe('#getCustomExecutionRole()', () => {
+    it('ignores inherited function roles', () => {
+      const functionObj = Object.create({ role: 'InheritedFunctionRole' });
+
+      expect(awsProvider.getCustomExecutionRole(functionObj)).to.equal(undefined);
+    });
+
+    it('ignores inherited provider iam roles', () => {
+      serverless.service.provider.iam = Object.create({ role: 'InheritedIamRole' });
+
+      expect(awsProvider.getCustomExecutionRole({})).to.equal(undefined);
+    });
+  });
+
+  describe('#resolveFunctionIamRoleResourceName()', () => {
+    it('ignores inherited Fn::GetAtt role references', () => {
+      const functionObj = {
+        role: Object.create({ 'Fn::GetAtt': ['InjectedRole', 'Arn'] }),
+      };
+
+      expect(awsProvider.resolveFunctionIamRoleResourceName(functionObj)).to.equal(
+        'IamRoleLambdaExecution'
+      );
+    });
+
+    it('ignores inherited Ref role references', () => {
+      const functionObj = {
+        role: Object.create({ Ref: 'ImportedRole' }),
+      };
+
+      expect(awsProvider.resolveFunctionIamRoleResourceName(functionObj)).to.equal(
+        'IamRoleLambdaExecution'
+      );
+    });
+  });
+
+  describe('runtime schema parity', () => {
+    it('should keep `awsLambdaRuntime` in sync with `AwsLambdaRuntime`', () => {
+      const localServerless = new Serverless({ ...options, commands: [], options: {} });
+      const runtimeTypePath = path.resolve(__dirname, '../../../../../types/index.d.ts');
+      const runtimeTypeSource = fs.readFileSync(runtimeTypePath, 'utf8');
+
+      localServerless.service.provider.name = 'aws';
+      localServerless.cli = new localServerless.classes.CLI();
+      const localAwsProvider = new AwsProvider(localServerless, options);
+      expect(localAwsProvider.serverless).to.equal(localServerless);
+
+      const runtimeTypeMatch = runtimeTypeSource.match(
+        /export type AwsLambdaRuntime\s*=\s*([\s\S]*?);/
+      );
+
+      if (!runtimeTypeMatch) {
+        throw new Error('Could not find AwsLambdaRuntime type declaration');
+      }
+
+      const providerRuntimes = [
+        ...localServerless.configSchemaHandler.schema.definitions.awsLambdaRuntime.enum,
+      ].sort();
+      const typeRuntimes = [...runtimeTypeMatch[1].matchAll(/'([^']+)'/g)]
+        .map((match) => match[1])
+        .sort();
+      const missingInTypes = providerRuntimes.filter((runtime) => !typeRuntimes.includes(runtime));
+      const missingInProvider = typeRuntimes.filter(
+        (runtime) => !providerRuntimes.includes(runtime)
+      );
+
+      expect(
+        providerRuntimes,
+        `awsLambdaRuntime mismatch:\nmissing in types: ${
+          missingInTypes.join(', ') || 'none'
+        }\nmissing in provider: ${missingInProvider.join(', ') || 'none'}`
+      ).to.deep.equal(typeRuntimes);
+    });
+  });
 
   describe('#constructor()', () => {
     it('should set Serverless instance', () => {
@@ -127,13 +266,13 @@ describe('AwsProvider', () => {
     });
     describe('#firstValue', () => {
       it("should ignore entries without a 'value' attribute", () => {
-        const input = _.cloneDeep(getExpected);
+        const input = structuredClone(getExpected);
         delete input[0].value;
         delete input[2].value;
         expect(awsProvider.firstValue(input)).to.eql(getExpected[1]);
       });
       it("should ignore entries with an undefined 'value' attribute", () => {
-        const input = _.cloneDeep(getExpected);
+        const input = structuredClone(getExpected);
         input[0].value = undefined;
         input[2].value = undefined;
         expect(awsProvider.firstValue(input)).to.eql(getExpected[1]);
@@ -142,19 +281,19 @@ describe('AwsProvider', () => {
         expect(awsProvider.firstValue(getExpected)).to.equal(getExpected[0]);
       });
       it('should return the middle value', () => {
-        const input = _.cloneDeep(getExpected);
+        const input = structuredClone(getExpected);
         delete input[0].value;
         delete input[2].value;
         expect(awsProvider.firstValue(input)).to.equal(input[1]);
       });
       it('should return the last value', () => {
-        const input = _.cloneDeep(getExpected);
+        const input = structuredClone(getExpected);
         delete input[0].value;
         delete input[1].value;
         expect(awsProvider.firstValue(input)).to.equal(input[2]);
       });
       it('should return the last object if none have valid values', () => {
-        const input = _.cloneDeep(getExpected);
+        const input = structuredClone(getExpected);
         delete input[0].value;
         delete input[1].value;
         delete input[2].value;
@@ -163,118 +302,499 @@ describe('AwsProvider', () => {
     });
   });
 
-  describe('#request()', () => {
-    let awsRequestStub;
-    let awsProviderProxied;
+  describe('#getAwsSdkV3Config()', () => {
+    it('returns SDK v3 config with explicit region and env credentials', async () => {
+      process.env.AWS_ACCESS_KEY_ID = 'accessKeyId';
+      process.env.AWS_SECRET_ACCESS_KEY = 'secretAccessKey';
+      process.env.AWS_SESSION_TOKEN = 'sessionToken';
 
-    beforeEach(() => {
-      awsRequestStub = sinon.stub().resolves();
-      awsRequestStub.memoized = sinon.stub().resolves();
-      const AwsProviderProxyquired = proxyquire
-        .noCallThru()
-        .load('../../../../../lib/plugins/aws/provider.js', {
-          '../../aws/request': awsRequestStub,
-          '@serverless/utils/log': {
-            log: {
-              debug: sinon.stub(),
-            },
-          },
-        });
-      awsProviderProxied = new AwsProviderProxyquired(serverless, options);
-    });
+      const config = await awsProvider.getAwsSdkV3Config({ region: 'eu-west-1' });
 
-    afterEach(() => {});
-
-    it('should pass resolved credentials as expected', async () => {
-      awsProviderProxied.cachedCredentials = {
+      expect(config.region).to.equal('eu-west-1');
+      expect(config.credentials).to.be.a('function');
+      await expect(config.credentials()).to.eventually.deep.equal({
         accessKeyId: 'accessKeyId',
         secretAccessKey: 'secretAccessKey',
         sessionToken: 'sessionToken',
-      };
-      await awsProviderProxied.request('S3', 'getObject', {});
-      expect(awsRequestStub.args[0][0]).to.deep.equal({
-        name: 'S3',
-        params: {
-          ...awsProviderProxied.cachedCredentials,
-          region: 'us-east-1',
-          isS3TransferAccelerationEnabled: false,
-        },
       });
     });
 
-    it('should trigger the expected AWS SDK invokation', async () => {
-      return awsProviderProxied.request('S3', 'getObject', {}).then(() => {
-        expect(awsRequestStub).to.have.been.calledOnce;
+    it('prefers stage-specific env credentials over standard env credentials', async () => {
+      process.env.AWS_ACCESS_KEY_ID = 'accessKeyId';
+      process.env.AWS_SECRET_ACCESS_KEY = 'secretAccessKey';
+      process.env.AWS_DEV_ACCESS_KEY_ID = 'stageAccessKeyId';
+      process.env.AWS_DEV_SECRET_ACCESS_KEY = 'stageSecretAccessKey';
+
+      const config = await awsProvider.getAwsSdkV3Config();
+
+      await expect(config.credentials()).to.eventually.deep.equal({
+        accessKeyId: 'stageAccessKeyId',
+        secretAccessKey: 'stageSecretAccessKey',
+        sessionToken: undefined,
       });
     });
 
-    it('should use local cache when using {useCache: true}', async () => {
-      return awsProviderProxied
-        .request('S3', 'getObject', {}, { useCache: true })
-        .then(() => awsProviderProxied.request('S3', 'getObject', {}, { useCache: true }))
-        .then(() => {
-          expect(awsRequestStub).to.not.have.been.called;
-          expect(awsRequestStub.memoized).to.have.been.calledTwice;
+    it('includes SDK v3 request handler configuration', async () => {
+      process.env.AWS_CLIENT_TIMEOUT = '1234';
+
+      const config = await awsProvider.getAwsSdkV3Config();
+
+      expect(config.requestHandler).to.exist;
+    });
+
+    it('falls back to provider region only when SDK v3 region is undefined', async () => {
+      expect((await awsProvider.getAwsSdkV3Config({ region: undefined })).region).to.equal(
+        'us-east-1'
+      );
+      expect((await awsProvider.getAwsSdkV3Config({ region: '' })).region).to.equal('');
+      expect((await awsProvider.getAwsSdkV3Config({ region: null })).region).to.equal(null);
+    });
+
+    it('passes profile and custom options to the config helpers', async () => {
+      const buildClientConfigStub = sinon.stub().returns({ config: true });
+      const credentialsProvider = sinon
+        .stub()
+        .resolves({ accessKeyId: 'key', secretAccessKey: 'secret' });
+      const getAwsSdkV3CredentialsProviderStub = sinon.stub().returns(credentialsProvider);
+      const getAwsSdkV3CredentialsProviderCacheKeyStub = sinon.stub().returns('cache-key');
+      const AwsProviderProxyquired = proxyquire
+        .noCallThru()
+        .load('../../../../../lib/plugins/aws/provider.js', {
+          '../../aws/config': { buildClientConfig: buildClientConfigStub },
+          '../../aws/credentials': {
+            getAwsSdkV3CredentialsProviderCacheKey: getAwsSdkV3CredentialsProviderCacheKeyStub,
+            getAwsSdkV3CredentialsProvider: getAwsSdkV3CredentialsProviderStub,
+          },
         });
+      const provider = new AwsProviderProxyquired(serverless, options);
+
+      const config = await provider.getAwsSdkV3Config({
+        profile: 'custom-profile',
+        maxAttempts: 2,
+        retryMode: 'adaptive',
+      });
+
+      expect(config).to.deep.equal({ config: true });
+      expect(getAwsSdkV3CredentialsProviderStub).to.have.been.calledOnceWithExactly({
+        provider,
+        profile: 'custom-profile',
+      });
+      expect(buildClientConfigStub).to.have.been.calledOnce;
+      const buildConfigInput = buildClientConfigStub.firstCall.args[0];
+      expect(buildConfigInput).to.include({
+        maxAttempts: 2,
+        retryMode: 'adaptive',
+        region: 'us-east-1',
+      });
+      expect(buildConfigInput.credentials).to.be.a('function');
+      await expect(buildConfigInput.credentials({ caller: 'test' })).to.eventually.deep.equal({
+        accessKeyId: 'key',
+        secretAccessKey: 'secret',
+      });
+      expect(credentialsProvider).to.have.been.calledOnceWithExactly({ caller: 'test' });
+    });
+
+    it('normalizes generic SDK v3 missing credentials errors', async () => {
+      const missingCredentialsError = new Error('Could not load credentials from any providers');
+      const credentialsProvider = sinon.stub().rejects(missingCredentialsError);
+      const AwsProviderProxyquired = proxyquire
+        .noCallThru()
+        .load('../../../../../lib/plugins/aws/provider.js', {
+          '../../aws/credentials': {
+            getAwsSdkV3CredentialsProviderCacheKey: sinon.stub().returns('cache-key'),
+            getAwsSdkV3CredentialsProvider: sinon.stub().returns(credentialsProvider),
+          },
+        });
+      const provider = new AwsProviderProxyquired(serverless, options);
+
+      const config = await provider.getAwsSdkV3Config();
+
+      try {
+        await config.credentials();
+        throw new Error('Expected credentials provider to reject');
+      } catch (error) {
+        expect(error.code).to.equal('AWS_CREDENTIALS_NOT_FOUND');
+      }
+    });
+
+    it('does not normalize inherited generic SDK v3 missing credentials messages', async () => {
+      const inheritedMissingCredentialsError = Object.create({
+        message: 'Could not load credentials from any providers',
+      });
+      const credentialsProvider = sinon.stub().rejects(inheritedMissingCredentialsError);
+      const AwsProviderProxyquired = proxyquire
+        .noCallThru()
+        .load('../../../../../lib/plugins/aws/provider.js', {
+          '../../aws/credentials': {
+            getAwsSdkV3CredentialsProviderCacheKey: sinon.stub().returns('cache-key'),
+            getAwsSdkV3CredentialsProvider: sinon.stub().returns(credentialsProvider),
+          },
+        });
+      const provider = new AwsProviderProxyquired(serverless, options);
+
+      const config = await provider.getAwsSdkV3Config();
+
+      try {
+        await config.credentials();
+        throw new Error('Expected credentials provider to reject');
+      } catch (error) {
+        expect(error).to.equal(inheritedMissingCredentialsError);
+        expect(error.code).to.equal(undefined);
+      }
+    });
+
+    it('does not normalize specific SDK v3 credential provider errors', async () => {
+      const ssoError = Object.assign(new Error('The SSO session has expired'), {
+        name: 'CredentialsProviderError',
+      });
+      const credentialsProvider = sinon.stub().rejects(ssoError);
+      const AwsProviderProxyquired = proxyquire
+        .noCallThru()
+        .load('../../../../../lib/plugins/aws/provider.js', {
+          '../../aws/credentials': {
+            getAwsSdkV3CredentialsProviderCacheKey: sinon.stub().returns('cache-key'),
+            getAwsSdkV3CredentialsProvider: sinon.stub().returns(credentialsProvider),
+          },
+        });
+      const provider = new AwsProviderProxyquired(serverless, options);
+
+      const config = await provider.getAwsSdkV3Config();
+
+      try {
+        await config.credentials();
+        throw new Error('Expected credentials provider to reject');
+      } catch (error) {
+        expect(error).to.equal(ssoError);
+        expect(error.code).to.not.equal('AWS_CREDENTIALS_NOT_FOUND');
+      }
+    });
+
+    it('does not mask credential provider errors with non-string messages', async () => {
+      const nonStringMessageError = { message: { text: 'Could not load credentials' } };
+      const credentialsProvider = sinon.stub().rejects(nonStringMessageError);
+      const AwsProviderProxyquired = proxyquire
+        .noCallThru()
+        .load('../../../../../lib/plugins/aws/provider.js', {
+          '../../aws/credentials': {
+            getAwsSdkV3CredentialsProviderCacheKey: sinon.stub().returns('cache-key'),
+            getAwsSdkV3CredentialsProvider: sinon.stub().returns(credentialsProvider),
+          },
+        });
+      const provider = new AwsProviderProxyquired(serverless, options);
+
+      const config = await provider.getAwsSdkV3Config();
+
+      try {
+        await config.credentials();
+        throw new Error('Expected credentials provider to reject');
+      } catch (error) {
+        expect(error).to.equal(nonStringMessageError);
+      }
+    });
+
+    it('reuses SDK v3 credential providers for the same credential source', async () => {
+      const firstConfig = await awsProvider.getAwsSdkV3Config();
+      const secondConfig = await awsProvider.getAwsSdkV3Config();
+
+      expect(firstConfig.credentials).to.equal(secondConfig.credentials);
+    });
+
+    it('uses different SDK v3 credential providers for different explicit profiles', async () => {
+      const firstConfig = await awsProvider.getAwsSdkV3Config({ profile: 'first' });
+      const secondConfig = await awsProvider.getAwsSdkV3Config({ profile: 'second' });
+
+      expect(firstConfig.credentials).to.not.equal(secondConfig.credentials);
+    });
+
+    it('passes SDK v3 client options through without leaking Serverless metadata options', async () => {
+      const requestHandler = {};
+
+      const config = await awsProvider.getAwsSdkV3Config({
+        service: 'S3',
+        profile: 'custom-profile',
+        endpoint: 'http://localhost:4566',
+        forcePathStyle: true,
+        requestHandler,
+      });
+
+      expect(config).to.include({
+        endpoint: 'http://localhost:4566',
+        forcePathStyle: true,
+        requestHandler,
+      });
+      expect(config).to.not.have.property('service');
+      expect(config).to.not.have.property('profile');
+    });
+
+    it('does not implicitly enable S3 acceleration for SDK v3 S3 configs', async () => {
+      awsProvider.options['aws-s3-accelerate'] = true;
+
+      const config = await awsProvider.getAwsSdkV3Config({ service: 'S3' });
+
+      expect(config).to.not.have.property('useAccelerateEndpoint');
+    });
+
+    it('preserves explicit SDK v3 S3 acceleration options', async () => {
+      awsProvider.options['aws-s3-accelerate'] = true;
+
+      const enabledConfig = await awsProvider.getAwsSdkV3Config({
+        service: 'S3',
+        useAccelerateEndpoint: true,
+      });
+      const disabledConfig = await awsProvider.getAwsSdkV3Config({
+        service: 'S3',
+        useAccelerateEndpoint: false,
+      });
+
+      expect(enabledConfig.useAccelerateEndpoint).to.equal(true);
+      expect(disabledConfig.useAccelerateEndpoint).to.equal(false);
     });
   });
 
   describe('#getServerlessDeploymentBucketName()', () => {
     it('should return the name of the serverless deployment bucket', async () => {
-      const describeStackResourcesStub = sinon.stub(awsProvider, 'request').resolves({
-        StackResourceDetail: {
-          PhysicalResourceId: 'serverlessDeploymentBucketName',
-        },
-      });
+      const describeStackResourcesStub = sinon
+        .stub(CloudFormationClient.prototype, 'send')
+        .resolves({
+          StackResourceDetail: {
+            PhysicalResourceId: 'serverlessDeploymentBucketName',
+          },
+        });
 
-      return awsProvider.getServerlessDeploymentBucketName().then((bucketName) => {
+      try {
+        const bucketName = await awsProvider.getServerlessDeploymentBucketName();
+
         expect(bucketName).to.equal('serverlessDeploymentBucketName');
         expect(describeStackResourcesStub.calledOnce).to.be.equal(true);
-        expect(
-          describeStackResourcesStub.calledWithExactly('CloudFormation', 'describeStackResource', {
-            StackName: awsProvider.naming.getStackName(),
-            LogicalResourceId: awsProvider.naming.getDeploymentBucketLogicalId(),
-          })
-        ).to.be.equal(true);
-        awsProvider.request.restore();
-      });
+        expect(describeStackResourcesStub.firstCall.args[0]).to.be.instanceOf(
+          DescribeStackResourceCommand
+        );
+        expect(describeStackResourcesStub.firstCall.args[0].input).to.deep.equal({
+          StackName: awsProvider.naming.getStackName(),
+          LogicalResourceId: awsProvider.naming.getDeploymentBucketLogicalId(),
+        });
+      } finally {
+        CloudFormationClient.prototype.send.restore();
+      }
     });
 
     it('should return the name of the custom deployment bucket', async () => {
       awsProvider.serverless.service.provider.deploymentBucket = 'custom-bucket';
 
-      const describeStackResourcesStub = sinon.stub(awsProvider, 'request').resolves({
-        StackResourceDetail: {
-          PhysicalResourceId: 'serverlessDeploymentBucketName',
-        },
-      });
+      const describeStackResourcesStub = sinon
+        .stub(CloudFormationClient.prototype, 'send')
+        .resolves({
+          StackResourceDetail: {
+            PhysicalResourceId: 'serverlessDeploymentBucketName',
+          },
+        });
 
-      return awsProvider.getServerlessDeploymentBucketName().then((bucketName) => {
+      try {
+        const bucketName = await awsProvider.getServerlessDeploymentBucketName();
+
         expect(describeStackResourcesStub.called).to.be.equal(false);
         expect(bucketName).to.equal('custom-bucket');
-        awsProvider.request.restore();
+      } finally {
+        CloudFormationClient.prototype.send.restore();
+      }
+    });
+
+    it('reuses one CloudFormation client across deployment bucket lookups', async () => {
+      const getAwsSdkV3ConfigSpy = sinon.spy(awsProvider, 'getAwsSdkV3Config');
+      const describeStackResourceStub = sinon
+        .stub(CloudFormationClient.prototype, 'send')
+        .onFirstCall()
+        .resolves({
+          StackResourceDetail: {
+            PhysicalResourceId: 'first-bucket',
+          },
+        })
+        .onSecondCall()
+        .resolves({
+          StackResourceDetail: {
+            PhysicalResourceId: 'second-bucket',
+          },
+        });
+
+      try {
+        await expect(awsProvider.getServerlessDeploymentBucketName()).to.eventually.equal(
+          'first-bucket'
+        );
+        await expect(awsProvider.getServerlessDeploymentBucketName()).to.eventually.equal(
+          'second-bucket'
+        );
+
+        expect(getAwsSdkV3ConfigSpy).to.have.been.calledOnce;
+        expect(describeStackResourceStub).to.have.been.calledTwice;
+        expect(describeStackResourceStub.firstCall.thisValue).to.equal(
+          describeStackResourceStub.secondCall.thisValue
+        );
+      } finally {
+        CloudFormationClient.prototype.send.restore();
+        awsProvider.getAwsSdkV3Config.restore();
+      }
+    });
+  });
+
+  describe('#getStackResources()', () => {
+    it('paginates ListStackResources with one SDK v3 client', async () => {
+      const getAwsSdkV3ConfigSpy = sinon.spy(awsProvider, 'getAwsSdkV3Config');
+      const listStackResourcesStub = sinon
+        .stub(CloudFormationClient.prototype, 'send')
+        .onFirstCall()
+        .resolves({
+          StackResourceSummaries: [{ LogicalResourceId: 'First' }],
+          NextToken: 'next-page',
+        })
+        .onSecondCall()
+        .resolves({
+          StackResourceSummaries: [{ LogicalResourceId: 'Second' }],
+        });
+
+      const resources = await awsProvider.getStackResources();
+
+      expect(resources).to.deep.equal([
+        { LogicalResourceId: 'First' },
+        { LogicalResourceId: 'Second' },
+      ]);
+      expect(listStackResourcesStub).to.have.been.calledTwice;
+      expect(listStackResourcesStub.firstCall.thisValue).to.equal(
+        listStackResourcesStub.secondCall.thisValue
+      );
+      expect(getAwsSdkV3ConfigSpy).to.have.been.calledOnce;
+      expect(listStackResourcesStub.firstCall.args[0]).to.be.instanceOf(ListStackResourcesCommand);
+      expect(listStackResourcesStub.firstCall.args[0].input).to.deep.equal({
+        StackName: awsProvider.naming.getStackName(),
       });
+      expect(listStackResourcesStub.secondCall.args[0].input).to.deep.equal({
+        StackName: awsProvider.naming.getStackName(),
+        NextToken: 'next-page',
+      });
+    });
+
+    it('preserves initial token and pre-seeded resources', async () => {
+      const listStackResourcesStub = sinon.stub(CloudFormationClient.prototype, 'send').resolves({
+        StackResourceSummaries: [{ LogicalResourceId: 'Second' }],
+      });
+
+      const resources = await awsProvider.getStackResources('next-page', [
+        { LogicalResourceId: 'First' },
+      ]);
+
+      expect(resources).to.deep.equal([
+        { LogicalResourceId: 'First' },
+        { LogicalResourceId: 'Second' },
+      ]);
+      expect(listStackResourcesStub).to.have.been.calledOnce;
+      expect(listStackResourcesStub.firstCall.args[0].input).to.deep.equal({
+        StackName: awsProvider.naming.getStackName(),
+        NextToken: 'next-page',
+      });
+    });
+
+    it('uses an existing CloudFormation client promise when listing stack resources', async () => {
+      const send = sinon.stub().resolves({
+        StackResourceSummaries: [{ LogicalResourceId: 'ExistingClientResource' }],
+      });
+      const getAwsSdkV3ConfigStub = sinon
+        .stub(awsProvider, 'getAwsSdkV3Config')
+        .throws(new Error('Expected existing CloudFormation client to be reused'));
+      awsProvider.cloudFormationClientPromise = Promise.resolve({ send });
+
+      try {
+        const resources = await awsProvider.getStackResources();
+
+        expect(resources).to.deep.equal([{ LogicalResourceId: 'ExistingClientResource' }]);
+        expect(getAwsSdkV3ConfigStub).to.not.have.been.called;
+        expect(send).to.have.been.calledOnce;
+        expect(send.firstCall.args[0]).to.be.instanceOf(ListStackResourcesCommand);
+        expect(send.firstCall.args[0].input).to.deep.equal({
+          StackName: awsProvider.naming.getStackName(),
+        });
+      } finally {
+        awsProvider.getAwsSdkV3Config.restore();
+      }
+    });
+
+    it('treats missing StackResourceSummaries as an empty page', async () => {
+      sinon.stub(CloudFormationClient.prototype, 'send').resolves({});
+
+      const resources = await awsProvider.getStackResources();
+
+      expect(resources).to.deep.equal([]);
     });
   });
 
   describe('#getAccountInfo()', () => {
+    it('defines memoized provider methods as lazy non-enumerable descriptors', () => {
+      const protoDescriptor = Object.getOwnPropertyDescriptor(
+        AwsProvider.prototype,
+        'getAccountInfo'
+      );
+
+      expect(protoDescriptor).to.include({ enumerable: false, configurable: true });
+      expect(protoDescriptor.get).to.be.a('function');
+      expect(Object.prototype.hasOwnProperty.call(awsProvider, 'getAccountInfo')).to.equal(false);
+
+      const method = awsProvider.getAccountInfo;
+
+      expect(awsProvider.getAccountInfo).to.equal(method);
+      expect(Object.prototype.hasOwnProperty.call(awsProvider, 'getAccountInfo')).to.equal(true);
+
+      const ownDescriptor = Object.getOwnPropertyDescriptor(awsProvider, 'getAccountInfo');
+
+      expect(ownDescriptor).to.include({
+        enumerable: false,
+        configurable: true,
+        writable: true,
+      });
+      expect(ownDescriptor.value).to.equal(method);
+    });
+
     it('should return the AWS account id and partition', async () => {
       const accountId = '12345678';
       const partition = 'aws';
 
-      const stsGetCallerIdentityStub = sinon.stub(awsProvider, 'request').resolves({
+      const stsGetCallerIdentityStub = sinon.stub(STSClient.prototype, 'send').resolves({
         ResponseMetadata: { RequestId: '12345678-1234-1234-1234-123456789012' },
         UserId: 'ABCDEFGHIJKLMNOPQRSTU:VWXYZ',
         Account: accountId,
         Arn: 'arn:aws:sts::123456789012:assumed-role/ROLE-NAME/VWXYZ',
       });
 
-      return awsProvider.getAccountInfo().then((result) => {
+      try {
+        const result = await awsProvider.getAccountInfo();
+
         expect(stsGetCallerIdentityStub.calledOnce).to.equal(true);
+        expect(stsGetCallerIdentityStub.firstCall.args[0]).to.be.instanceOf(
+          GetCallerIdentityCommand
+        );
+        expect(stsGetCallerIdentityStub.firstCall.args[0].input).to.deep.equal({});
         expect(result.accountId).to.equal(accountId);
         expect(result.partition).to.equal(partition);
-        awsProvider.request.restore();
+      } finally {
+        STSClient.prototype.send.restore();
+      }
+    });
+
+    it('memoizes successful promise results', async () => {
+      const stsGetCallerIdentityStub = sinon.stub(STSClient.prototype, 'send').resolves({
+        ResponseMetadata: { RequestId: '12345678-1234-1234-1234-123456789012' },
+        UserId: 'ABCDEFGHIJKLMNOPQRSTU:VWXYZ',
+        Account: '12345678',
+        Arn: 'arn:aws:sts::123456789012:assumed-role/ROLE-NAME/VWXYZ',
       });
+
+      try {
+        const firstResult = await awsProvider.getAccountInfo();
+        const secondResult = await awsProvider.getAccountInfo();
+
+        expect(firstResult.accountId).to.equal('12345678');
+        expect(secondResult).to.equal(firstResult);
+        expect(stsGetCallerIdentityStub).to.have.been.calledOnce;
+      } finally {
+        STSClient.prototype.send.restore();
+      }
     });
   });
 
@@ -282,18 +802,21 @@ describe('AwsProvider', () => {
     it('should return the AWS account id', async () => {
       const accountId = '12345678';
 
-      const stsGetCallerIdentityStub = sinon.stub(awsProvider, 'request').resolves({
+      const stsGetCallerIdentityStub = sinon.stub(STSClient.prototype, 'send').resolves({
         ResponseMetadata: { RequestId: '12345678-1234-1234-1234-123456789012' },
         UserId: 'ABCDEFGHIJKLMNOPQRSTU:VWXYZ',
         Account: accountId,
         Arn: 'arn:aws:sts::123456789012:assumed-role/ROLE-NAME/VWXYZ',
       });
 
-      return awsProvider.getAccountId().then((result) => {
+      try {
+        const result = await awsProvider.getAccountId();
+
         expect(stsGetCallerIdentityStub.calledOnce).to.equal(true);
         expect(result).to.equal(accountId);
-        awsProvider.request.restore();
-      });
+      } finally {
+        STSClient.prototype.send.restore();
+      }
     });
   });
 
@@ -318,273 +841,9 @@ describe('AwsProvider', () => {
 });
 
 describe('test/unit/lib/plugins/aws/provider.test.js', () => {
-  describe('#getProviderName and #sessionCache', () => {
-    let sls;
-    const expectedToken = '123';
-
-    before(async () => {
-      // Fake service that update credentials
-      class FakeCloudFormation {
-        constructor(credentials) {
-          this.credentials = credentials;
-          this.credentials.credentials.sessionToken = expectedToken;
-        }
-        describeStacks() {
-          return { promise: async () => {} };
-        }
-      }
-      // Stub functions for the credentials creation in the provider
-      class SharedIniFileCredentials {
-        constructor() {
-          this.sessionToken = 'abc';
-          this.accessKeyId = 'keyId';
-          this.secretAccessKey = 'secret';
-        }
-      }
-      class EnvironmentCredentials {
-        constructor() {
-          this.sessionToken = 'env';
-          this.accessKeyId = 'keyId';
-          this.secretAccessKey = 'secret';
-        }
-      }
-      class FakeMetadataService {}
-
-      const modulesCacheStub = {
-        'aws-sdk': {
-          SharedIniFileCredentials,
-          EnvironmentCredentials,
-          CloudFormation: FakeCloudFormation,
-          config: {},
-        },
-        'aws-sdk/lib/metadata_service': FakeMetadataService,
-      };
-      const { serverless } = await runServerless({
-        fixture: 'aws',
-        command: 'print',
-        modulesCacheStub,
-      });
-      sls = serverless;
-    });
-
+  describe('#getProviderName', () => {
     it('`AwsProvider.getProviderName()` should resolve provider name', () => {
       expect(AwsProvider.getProviderName()).to.equal('aws');
-    });
-
-    it('should retain sessionToken eventually updated internally by SDK', async () => {
-      expect(sls.getProvider('aws').getCredentials().credentials.sessionToken).not.to.equal(
-        expectedToken
-      );
-      await sls.getProvider('aws').request('CloudFormation', 'describeStacks');
-      expect(sls.getProvider('aws').getCredentials().credentials.sessionToken).to.equal(
-        expectedToken
-      );
-    });
-  });
-
-  describe('#getCredentials()', () => {
-    before(async () => {
-      // create default aws credentials file in before so that grouped run can use it
-      await fs.ensureDir(path.resolve(os.homedir(), './.aws'));
-      await fs.outputFile(
-        path.resolve(os.homedir(), './.aws/credentials'),
-        `
-[default]
-aws_access_key_id = DEFAULTKEYID
-aws_secret_access_key = DEFAULTSECRET
-
-[notDefault]
-aws_access_key_id = NOTDEFAULTKEYID
-aws_secret_access_key = NOTDEFAULTSECRET
-
-[notDefaultWithRole]
-source_profile = notDefault
-role_arn = NOTDEFAULTWITHROLEROLE
-`,
-        { flag: 'w+' }
-      );
-    });
-
-    it('should get credentials from default AWS profile', async () => {
-      const { serverless } = await runServerless({
-        fixture: 'aws',
-        command: 'print',
-      });
-      const awsCredentials = serverless.getProvider('aws').getCredentials();
-      expect(awsCredentials.credentials.accessKeyId).to.equal('DEFAULTKEYID');
-    });
-
-    it('should get credentials from custom default AWS profile, set by AWS_DEFAULT_PROFILE', async () => {
-      const { serverless } = await runServerless({
-        fixture: 'aws',
-        command: 'print',
-      });
-      // getCredentials resolve the env when called
-      let awsCredentials;
-      overrideEnv(() => {
-        process.env.AWS_DEFAULT_PROFILE = 'notDefault';
-        awsCredentials = serverless.getProvider('aws').getCredentials();
-      });
-      expect(awsCredentials.credentials.accessKeyId).to.equal('NOTDEFAULTKEYID');
-    });
-
-    describe('assume role with provider.profile', () => {
-      let awsCredentials;
-      before(async () => {
-        const { serverless } = await runServerless({
-          fixture: 'aws',
-          command: 'print',
-          configExt: {
-            provider: {
-              profile: 'notDefaultWithRole',
-            },
-          },
-        });
-        awsCredentials = serverless.getProvider('aws').getCredentials();
-      });
-
-      it('should get credentials from `provider.profile`', () => {
-        expect(awsCredentials.credentials.profile).to.equal('notDefaultWithRole');
-      });
-
-      it('should accept a role to assume on credentials', () => {
-        expect(awsCredentials.credentials.roleArn).to.equal('NOTDEFAULTWITHROLEROLE');
-      });
-    });
-
-    it('should get credentials from environment variables', async () => {
-      const { serverless } = await runServerless({
-        fixture: 'aws',
-        command: 'print',
-      });
-      let awsCredentials;
-      // getCredentials resolve the env when called
-      overrideEnv(() => {
-        process.env.AWS_ACCESS_KEY_ID = 'ENVKEYID';
-        process.env.AWS_SECRET_ACCESS_KEY = 'ENVSECRET';
-        awsCredentials = serverless.getProvider('aws').getCredentials();
-      });
-      expect(awsCredentials.credentials.accessKeyId).to.equal('ENVKEYID');
-    });
-
-    describe('profile with non default credentials file', () => {
-      let awsCredentials;
-      before(async () => {
-        await fs.outputFile(
-          path.resolve(os.homedir(), './custom_credentials'),
-          `
-[default]
-aws_access_key_id = DEFAULTKEYID
-aws_secret_access_key = DEFAULTSECRET
-
-[customProfile]
-aws_access_key_id = CUSTOMKEYID
-aws_secret_access_key = CUSTOMSECRET
-`,
-          { flag: 'w+' }
-        );
-        const { serverless } = await runServerless({
-          fixture: 'aws',
-          command: 'print',
-        });
-        // getCredentials resolve the env when called
-        overrideEnv(() => {
-          process.env.AWS_PROFILE = 'customProfile';
-          process.env.AWS_SHARED_CREDENTIALS_FILE = path
-            .resolve(os.homedir(), './custom_credentials')
-            .toString();
-          awsCredentials = serverless.getProvider('aws').getCredentials();
-        });
-      });
-
-      after(async () => {
-        await fs.remove(path.resolve(os.homedir(), './custom_credentials'));
-      });
-
-      it('should get credentials from AWS_PROFILE environment variable', () => {
-        expect(awsCredentials.credentials.profile).to.equal('customProfile');
-      });
-
-      it('should get credentials from AWS_SHARED_CREDENTIALS_FILE environment variable', () => {
-        expect(awsCredentials.credentials.accessKeyId).to.equal('CUSTOMKEYID');
-      });
-    });
-
-    it('should get credentials from stage specific environment variables', async () => {
-      const { serverless } = await runServerless({
-        fixture: 'aws',
-        command: 'print',
-        configExt: {
-          provider: {
-            stage: 'testStage',
-          },
-        },
-      });
-      let awsCredentials;
-      overrideEnv(() => {
-        process.env.AWS_TESTSTAGE_ACCESS_KEY_ID = 'TESTSTAGEACCESSKEYID';
-        process.env.AWS_TESTSTAGE_SECRET_ACCESS_KEY = 'TESTSTAGESECRET';
-        awsCredentials = serverless.getProvider('aws').getCredentials();
-      });
-      expect(awsCredentials.credentials.accessKeyId).to.equal('TESTSTAGEACCESSKEYID');
-    });
-
-    it('should get credentials from AWS_{stage}_PROFILE environment variable', async () => {
-      const { serverless } = await runServerless({
-        fixture: 'aws',
-        command: 'print',
-        configExt: {
-          provider: {
-            stage: 'testStage',
-          },
-        },
-      });
-      let awsCredentials;
-      overrideEnv(() => {
-        process.env.AWS_TESTSTAGE_PROFILE = 'notDefault';
-        awsCredentials = serverless.getProvider('aws').getCredentials();
-      });
-      expect(awsCredentials.credentials.accessKeyId).to.equal('NOTDEFAULTKEYID');
-    });
-
-    describe('profile with cli and encryption', () => {
-      let awsCredentials;
-      before(async () => {
-        const { serverless } = await runServerless({
-          fixture: 'aws',
-          command: 'print',
-          options: {
-            'aws-profile': 'notDefault',
-          },
-          configExt: {
-            provider: {
-              deploymentBucket: {
-                serverSideEncryption: 'aws:kms',
-              },
-            },
-          },
-        });
-        awsCredentials = serverless.getProvider('aws').getCredentials();
-      });
-
-      it('should get credentials "--aws-profile" CLI option', () => {
-        expect(awsCredentials.credentials.accessKeyId).to.equal('NOTDEFAULTKEYID');
-      });
-
-      it('should set the signatureVersion to v4 if the serverSideEncryption is aws:kms', () => {
-        expect(awsCredentials.signatureVersion).to.equal('v4');
-      });
-    });
-
-    it('should throw an error if a non-existent profile is set', async () => {
-      const { serverless } = await runServerless({
-        fixture: 'aws',
-        command: 'print',
-        options: {
-          'aws-profile': 'nonExistent',
-        },
-      });
-      expect(() => serverless.getProvider('aws').getCredentials()).to.throw(Error);
     });
   });
 
@@ -791,6 +1050,45 @@ aws_secret_access_key = CUSTOMSECRET
         },
       });
       expect(serverless.getProvider('aws').getStage()).to.equal('production');
+    });
+
+    it('should reject invalid stage from provider options', () => {
+      const serverless = new Serverless({ commands: ['print'], options: {}, serviceDir: null });
+      const provider = new AwsProvider(serverless, { stage: 'foo/bar' });
+
+      expect(() => provider.getStage())
+        .to.throw(ServerlessError)
+        .and.have.property('code', 'INVALID_STAGE');
+    });
+
+    it('should reject invalid stage from serverless config', () => {
+      const serverless = new Serverless({ commands: ['print'], options: {}, serviceDir: null });
+      serverless.config.stage = 'feature.prod';
+      const provider = new AwsProvider(serverless, {});
+
+      expect(() => provider.getStage())
+        .to.throw(ServerlessError)
+        .and.have.property('code', 'INVALID_STAGE');
+    });
+
+    it('should reject invalid stage from service provider config', () => {
+      const serverless = new Serverless({ commands: ['print'], options: {}, serviceDir: null });
+      const provider = new AwsProvider(serverless, {});
+      serverless.service.provider.stage = 'my_stage';
+
+      expect(() => provider.getStage())
+        .to.throw(ServerlessError)
+        .and.have.property('code', 'INVALID_STAGE');
+    });
+
+    it('should reject empty CLI stage instead of falling back to provider stage', () => {
+      const serverless = new Serverless({ commands: ['print'], options: {}, serviceDir: null });
+      serverless.service.provider.stage = 'prod';
+      const provider = new AwsProvider(serverless, { stage: '' });
+
+      expect(() => provider.getStage())
+        .to.throw(ServerlessError)
+        .and.have.property('code', 'INVALID_STAGE');
     });
   });
 
@@ -1245,6 +1543,114 @@ aws_secret_access_key = CUSTOMSECRET
           })
         ).to.be.eventually.rejected.and.have.property('code', 'LAMBDA_ECR_REGION_MISMATCH_ERROR');
       });
+
+      it('should surface native SDK v3 image lookup errors', async () => {
+        const imageNotFoundError = Object.assign(new Error('Image not found'), {
+          name: 'ImageNotFoundException',
+        });
+
+        try {
+          await runServerless({
+            fixture: 'function',
+            command: 'package',
+            configExt: {
+              functions: {
+                fnImageWithTag: {
+                  image: '000000000000.dkr.ecr.us-east-1.amazonaws.com/test-lambda-docker:stable',
+                },
+              },
+            },
+            awsRequestStubMap: {
+              ECR: {
+                describeImages: () => {
+                  throw imageNotFoundError;
+                },
+              },
+            },
+          });
+        } catch (error) {
+          expect(error).to.equal(imageNotFoundError);
+          return;
+        }
+
+        throw new Error('Expected package to reject');
+      });
+
+      it('limits concurrent ECR image tag lookups to 6', async () => {
+        const pendingResolvers = [];
+        let activeRequests = 0;
+        let observedMaxActiveRequests = 0;
+        const imageLookupStub = sinon.stub().callsFake(async () => {
+          activeRequests += 1;
+          observedMaxActiveRequests = Math.max(observedMaxActiveRequests, activeRequests);
+          expect(activeRequests).to.be.at.most(6);
+          await new Promise((resolve) => pendingResolvers.push(resolve));
+          activeRequests -= 1;
+          return { imageDetails: [{ imageDigest: imageDigestFromECR }] };
+        });
+        const functions = Object.fromEntries(
+          Array.from({ length: 10 }, (ignored, index) => [
+            `fnImageWithTag${index}`,
+            {
+              image: `000000000000.dkr.ecr.us-east-1.amazonaws.com/test-lambda-docker:tag${index}`,
+            },
+          ])
+        );
+
+        const promise = runServerless({
+          fixture: 'function',
+          command: 'package',
+          configExt: { functions },
+          awsRequestStubMap: {
+            ECR: {
+              describeImages: imageLookupStub,
+            },
+          },
+        });
+
+        let isSettled = false;
+        let result;
+        let thrownError;
+        promise
+          .then(
+            (value) => {
+              result = value;
+            },
+            (error) => {
+              thrownError = error;
+            }
+          )
+          .finally(() => {
+            isSettled = true;
+          })
+          .catch(() => {});
+        for (let index = 0; index < 100 && pendingResolvers.length < 6 && !isSettled; index += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 0));
+        }
+        expect(observedMaxActiveRequests).to.equal(6);
+        while (!isSettled) {
+          for (const resolve of pendingResolvers.splice(0)) resolve();
+          await new Promise((resolve) => setTimeout(resolve, 0));
+        }
+        if (thrownError) throw thrownError;
+        const { awsSdkV3Stub, serverless } = result;
+        const expectedCredentials = serverless.getProvider('aws').getAwsSdkV3CredentialsProvider();
+        const imageLookupSends = awsSdkV3Stub.sends.filter(
+          ({ service, method }) => service === 'ECR' && method === 'describeImages'
+        );
+
+        expect(observedMaxActiveRequests).to.equal(6);
+        expect(imageLookupSends).to.have.length(10);
+        expect(new Set(imageLookupSends.map(({ client }) => client)).size).to.equal(1);
+        expect(imageLookupSends.map(({ input }) => input.imageIds[0].imageTag)).to.have.members(
+          Array.from({ length: 10 }, (ignored, index) => `tag${index}`)
+        );
+        expect(
+          imageLookupSends.every(
+            ({ clientConfig }) => clientConfig.credentials === expectedCredentials
+          )
+        ).to.equal(true);
+      });
     });
 
     describe('with `functions[].image` referencing images that require building', () => {
@@ -1255,6 +1661,7 @@ aws_secret_access_key = CUSTOMSECRET
       const describeRepositoriesStub = sinon.stub();
       const createRepositoryStub = sinon.stub();
       const createRepositoryStubScanOnPush = sinon.stub();
+      const putLifecyclePolicyStub = sinon.stub();
       const baseAwsRequestStubMap = {
         STS: {
           getCallerIdentity: {
@@ -1282,12 +1689,23 @@ aws_secret_access_key = CUSTOMSECRET
         stdBuffer: `digest: sha256:${imageSha} size: 1787`,
       });
       const modulesCacheStub = {
-        'child-process-ext/spawn': spawnExtStub,
+        [spawnModulePath]: spawnExtStub,
+      };
+      const getEcrSend = (awsSdkV3Stub, method) =>
+        awsSdkV3Stub.sends.find((send) => send.service === 'ECR' && send.method === method);
+      const expectEcrSendInput = (awsSdkV3Stub, method, input) => {
+        const send = getEcrSend(awsSdkV3Stub, method);
+
+        expect(send).to.exist;
+        expect(send.input).to.deep.equal(input);
+        return send;
       };
 
       beforeEach(() => {
         describeRepositoriesStub.reset();
         createRepositoryStub.reset();
+        createRepositoryStubScanOnPush.reset();
+        putLifecyclePolicyStub.reset();
         spawnExtStub.resetHistory();
       });
 
@@ -1304,7 +1722,9 @@ aws_secret_access_key = CUSTOMSECRET
         };
         const {
           awsNaming,
+          awsSdkV3Stub,
           cfTemplate,
+          serverless,
           fixtureData: { servicePath: serviceDir },
         } = await runServerless({
           fixture: 'ecr',
@@ -1320,7 +1740,20 @@ aws_secret_access_key = CUSTOMSECRET
         expect(functionCfConfig.Code.ImageUri).to.deep.equal(`${repositoryUri}@sha256:${imageSha}`);
         expect(versionCfConfig.CodeSha256).to.equal(imageSha);
         expect(describeRepositoriesStub).to.be.calledOnce;
+        expect(describeRepositoriesStub.firstCall.args[0]).to.deep.equal({
+          repositoryNames: [awsNaming.getEcrRepositoryName()],
+          registryId: '999999999999',
+        });
         expect(createRepositoryStub.notCalled).to.be.true;
+        expect(
+          awsSdkV3Stub.clients
+            .filter(({ service }) => service === 'ECR')
+            .every(
+              ({ config }) =>
+                config.credentials ===
+                serverless.getProvider('aws').getAwsSdkV3CredentialsProvider()
+            )
+        ).to.equal(true);
         expect(spawnExtStub).to.be.calledWith('docker', ['--version']);
         expect(spawnExtStub).not.to.be.calledWith('docker', [
           'login',
@@ -1360,7 +1793,7 @@ aws_secret_access_key = CUSTOMSECRET
           },
         };
 
-        const { awsNaming, cfTemplate } = await runServerless({
+        const { awsNaming, awsSdkV3Stub, cfTemplate, serverless } = await runServerless({
           fixture: 'ecr',
           command: 'package',
           awsRequestStubMap,
@@ -1388,9 +1821,13 @@ aws_secret_access_key = CUSTOMSECRET
         expect(versionCfConfig.CodeSha256).to.equal(imageSha);
         expect(describeRepositoriesStub).to.be.calledOnce;
         expect(createRepositoryStubScanOnPush).to.be.calledOnce;
-        expect(createRepositoryStubScanOnPush.args[0][0].imageScanningConfiguration).to.deep.equal({
-          scanOnPush: true,
+        const createRepositorySend = expectEcrSendInput(awsSdkV3Stub, 'createRepository', {
+          repositoryName: awsNaming.getEcrRepositoryName(),
+          imageScanningConfiguration: { scanOnPush: true },
         });
+        expect(createRepositorySend.clientConfig.credentials).to.equal(
+          serverless.getProvider('aws').getAwsSdkV3CredentialsProvider()
+        );
       });
 
       it('should work correctly when repository does not exist beforehand', async () => {
@@ -1405,7 +1842,7 @@ aws_secret_access_key = CUSTOMSECRET
           },
         };
 
-        const { awsNaming, cfTemplate } = await runServerless({
+        const { awsNaming, awsSdkV3Stub, cfTemplate, serverless } = await runServerless({
           fixture: 'ecr',
           command: 'package',
           awsRequestStubMap,
@@ -1420,6 +1857,105 @@ aws_secret_access_key = CUSTOMSECRET
         expect(versionCfConfig.CodeSha256).to.equal(imageSha);
         expect(describeRepositoriesStub).to.be.calledOnce;
         expect(createRepositoryStub).to.be.calledOnce;
+        const createRepositorySend = expectEcrSendInput(awsSdkV3Stub, 'createRepository', {
+          repositoryName: awsNaming.getEcrRepositoryName(),
+          imageScanningConfiguration: { scanOnPush: false },
+        });
+        expect(createRepositorySend.clientConfig.credentials).to.equal(
+          serverless.getProvider('aws').getAwsSdkV3CredentialsProvider()
+        );
+        expect(putLifecyclePolicyStub).to.not.have.been.called;
+      });
+
+      it('should create repository for native SDK v3 repository not found errors', async () => {
+        const awsRequestStubMap = {
+          ...baseAwsRequestStubMap,
+          ECR: {
+            ...baseAwsRequestStubMap.ECR,
+            describeRepositories: describeRepositoriesStub.throws(
+              Object.assign(new Error('Repository not found'), {
+                name: 'RepositoryNotFoundException',
+              })
+            ),
+            createRepository: createRepositoryStub.resolves({ repository: { repositoryUri } }),
+          },
+        };
+
+        const { awsNaming, awsSdkV3Stub, cfTemplate, serverless } = await runServerless({
+          fixture: 'ecr',
+          command: 'package',
+          awsRequestStubMap,
+          modulesCacheStub,
+        });
+
+        const functionCfLogicalId = awsNaming.getLambdaLogicalId('foo');
+        const functionCfConfig = cfTemplate.Resources[functionCfLogicalId].Properties;
+        const versionCfConfig = findVersionCfConfig(cfTemplate.Resources, functionCfLogicalId);
+
+        expect(functionCfConfig.Code.ImageUri).to.deep.equal(`${repositoryUri}@sha256:${imageSha}`);
+        expect(versionCfConfig.CodeSha256).to.equal(imageSha);
+        expect(describeRepositoriesStub).to.be.calledOnce;
+        expect(createRepositoryStub).to.be.calledOnce;
+        const createRepositorySend = expectEcrSendInput(awsSdkV3Stub, 'createRepository', {
+          repositoryName: awsNaming.getEcrRepositoryName(),
+          imageScanningConfiguration: { scanOnPush: false },
+        });
+        expect(createRepositorySend.clientConfig.credentials).to.equal(
+          serverless.getProvider('aws').getAwsSdkV3CredentialsProvider()
+        );
+      });
+
+      it('should set ECR lifecycle policy correctly', async () => {
+        const awsRequestStubMap = {
+          ...baseAwsRequestStubMap,
+          ECR: {
+            ...baseAwsRequestStubMap.ECR,
+            describeRepositories: describeRepositoriesStub.throws({
+              providerError: { code: 'RepositoryNotFoundException' },
+            }),
+            createRepository: createRepositoryStub.resolves({ repository: { repositoryUri } }),
+            putLifecyclePolicy: putLifecyclePolicyStub.resolves(),
+          },
+        };
+
+        const { awsNaming, awsSdkV3Stub, serverless } = await runServerless({
+          fixture: 'ecr',
+          command: 'package',
+          awsRequestStubMap,
+          modulesCacheStub,
+          configExt: {
+            provider: {
+              ecr: {
+                maxImageCount: 10,
+              },
+            },
+          },
+        });
+
+        const expectedLifecyclePolicy = {
+          rules: [
+            {
+              rulePriority: 1,
+              action: { type: 'expire' },
+              selection: {
+                tagStatus: 'any',
+                countType: 'imageCountMoreThan',
+                countNumber: 10,
+              },
+            },
+          ],
+        };
+
+        expect(JSON.parse(putLifecyclePolicyStub.args[0][0].lifecyclePolicyText)).to.deep.equal(
+          expectedLifecyclePolicy
+        );
+        const putLifecyclePolicySend = expectEcrSendInput(awsSdkV3Stub, 'putLifecyclePolicy', {
+          repositoryName: awsNaming.getEcrRepositoryName(),
+          lifecyclePolicyText: JSON.stringify(expectedLifecyclePolicy),
+        });
+        expect(putLifecyclePolicySend.clientConfig.credentials).to.equal(
+          serverless.getProvider('aws').getAwsSdkV3CredentialsProvider()
+        );
       });
 
       it('should login and retry when docker push fails with no basic auth credentials error', async () => {
@@ -1442,7 +1978,9 @@ aws_secret_access_key = CUSTOMSECRET
           .throws({ stdBuffer: 'no basic auth credentials' });
         const {
           awsNaming,
+          awsSdkV3Stub,
           cfTemplate,
+          serverless,
           fixtureData: { servicePath: serviceDir },
         } = await runServerless({
           fixture: 'ecr',
@@ -1450,7 +1988,7 @@ aws_secret_access_key = CUSTOMSECRET
           awsRequestStubMap,
           modulesCacheStub: {
             ...modulesCacheStub,
-            'child-process-ext/spawn': innerSpawnExtStub,
+            [spawnModulePath]: innerSpawnExtStub,
           },
         });
 
@@ -1488,6 +2026,14 @@ aws_secret_access_key = CUSTOMSECRET
           'dockerauthtoken',
           proxyEndpoint,
         ]);
+        const getAuthorizationTokenSend = expectEcrSendInput(
+          awsSdkV3Stub,
+          'getAuthorizationToken',
+          { registryIds: ['999999999999'] }
+        );
+        expect(getAuthorizationTokenSend.clientConfig.credentials).to.equal(
+          serverless.getProvider('aws').getAwsSdkV3CredentialsProvider()
+        );
       });
 
       it('should login and retry when docker push fails with token has expired error', async () => {
@@ -1508,13 +2054,13 @@ aws_secret_access_key = CUSTOMSECRET
           })
           .onCall(3)
           .throws({ stdBuffer: 'authorization token has expired' });
-        await runServerless({
+        const { awsSdkV3Stub, serverless } = await runServerless({
           fixture: 'ecr',
           command: 'package',
           awsRequestStubMap,
           modulesCacheStub: {
             ...modulesCacheStub,
-            'child-process-ext/spawn': innerSpawnExtStub,
+            [spawnModulePath]: innerSpawnExtStub,
           },
         });
 
@@ -1530,6 +2076,14 @@ aws_secret_access_key = CUSTOMSECRET
           'dockerauthtoken',
           proxyEndpoint,
         ]);
+        const getAuthorizationTokenSend = expectEcrSendInput(
+          awsSdkV3Stub,
+          'getAuthorizationToken',
+          { registryIds: ['999999999999'] }
+        );
+        expect(getAuthorizationTokenSend.clientConfig.credentials).to.equal(
+          serverless.getProvider('aws').getAwsSdkV3CredentialsProvider()
+        );
       });
 
       it('should work correctly when image is defined with implicit path in provider', async () => {
@@ -1914,7 +2468,7 @@ aws_secret_access_key = CUSTOMSECRET
             command: 'package',
             awsRequestStubMap: baseAwsRequestStubMap,
             modulesCacheStub: {
-              'child-process-ext/spawn': sinon.stub().throws(),
+              [spawnModulePath]: sinon.stub().throws(),
             },
           })
         ).to.be.eventually.rejected.and.have.property('code', 'DOCKER_COMMAND_NOT_AVAILABLE');
@@ -1928,7 +2482,7 @@ aws_secret_access_key = CUSTOMSECRET
             awsRequestStubMap: baseAwsRequestStubMap,
             modulesCacheStub: {
               ...modulesCacheStub,
-              'child-process-ext/spawn': sinon.stub().returns({}).onSecondCall().throws(),
+              [spawnModulePath]: sinon.stub().returns({}).onSecondCall().throws(),
             },
           })
         ).to.be.eventually.rejected.and.have.property('code', 'DOCKER_BUILD_ERROR');
@@ -1942,7 +2496,7 @@ aws_secret_access_key = CUSTOMSECRET
             awsRequestStubMap: baseAwsRequestStubMap,
             modulesCacheStub: {
               ...modulesCacheStub,
-              'child-process-ext/spawn': sinon.stub().returns({}).onCall(2).throws(),
+              [spawnModulePath]: sinon.stub().returns({}).onCall(2).throws(),
             },
           })
         ).to.be.eventually.rejected.and.have.property('code', 'DOCKER_TAG_ERROR');
@@ -1956,7 +2510,7 @@ aws_secret_access_key = CUSTOMSECRET
             awsRequestStubMap: baseAwsRequestStubMap,
             modulesCacheStub: {
               ...modulesCacheStub,
-              'child-process-ext/spawn': sinon.stub().returns({}).onCall(3).throws(),
+              [spawnModulePath]: sinon.stub().returns({}).onCall(3).throws(),
             },
           })
         ).to.be.eventually.rejected.and.have.property('code', 'DOCKER_PUSH_ERROR');
@@ -1970,7 +2524,7 @@ aws_secret_access_key = CUSTOMSECRET
             awsRequestStubMap: baseAwsRequestStubMap,
             modulesCacheStub: {
               ...modulesCacheStub,
-              'child-process-ext/spawn': sinon
+              [spawnModulePath]: sinon
                 .stub()
                 .returns({})
                 .onCall(3)

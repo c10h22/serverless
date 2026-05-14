@@ -1,10 +1,7 @@
 'use strict';
 
-/* eslint-disable no-unused-expressions */
-
 const chai = require('chai');
-const overrideEnv = require('process-utils/override-env');
-const overrideArgv = require('process-utils/override-argv');
+const { overrideEnv, overrideArgv } = require('../../../utils/process');
 const runServerless = require('../../../utils/run-serverless');
 const fixtures = require('../../../fixtures/programmatic');
 const Serverless = require('../../../../lib/serverless');
@@ -13,18 +10,14 @@ const resolveInput = require('../../../../lib/cli/resolve-input');
 const Create = require('../../../../lib/plugins/create/create');
 const ServerlessError = require('../../../../lib/serverless-error');
 const getRequire = require('../../../../lib/utils/get-require');
+const importModule = require('../../../../lib/utils/require-with-import-fallback');
 
 const path = require('path');
 const fsp = require('fs').promises;
-const fse = require('fs-extra');
-const mockRequire = require('mock-require');
 const sinon = require('sinon');
 const proxyquire = require('proxyquire');
 const { installPlugin } = require('../../../utils/plugins');
-const { getTmpDirPath } = require('../../../utils/fs');
-
-chai.use(require('chai-as-promised'));
-chai.use(require('sinon-chai'));
+const { ensureDirSync, getTmpDirPath, removeSync } = require('../../../utils/fs');
 
 const expect = chai.expect;
 
@@ -259,7 +252,7 @@ describe('PluginManager', () => {
           type: 'entrypoint',
           lifecycleEvents: ['initialize', 'finalize'],
           commands: {
-            // EP, not public command because its parent is decalred as EP
+            // EP, not public command because its parent is declared as EP
             mysubep: {
               lifecycleEvents: ['initialize', 'finalize'],
             },
@@ -405,11 +398,16 @@ describe('PluginManager', () => {
 
   let restoreEnv;
   let serviceDir;
+  const servicePluginMocks = new Map();
   const PluginManager = proxyquire('../../../../lib/classes/plugin-manager', {
     '../utils/get-require': (directory) => {
       const resultRequire = require('module').createRequire(path.resolve(directory, 'req'));
       resultRequire.resolve = (pluginPath) => resolveStub(directory, pluginPath);
       return resultRequire;
+    },
+    '../utils/require-with-import-fallback': async (pluginPath) => {
+      if (servicePluginMocks.has(pluginPath)) return servicePluginMocks.get(pluginPath);
+      return importModule(pluginPath);
     },
   });
 
@@ -422,7 +420,10 @@ describe('PluginManager', () => {
     serviceDir = pluginManager.serverless.serviceDir = 'foo';
   });
 
-  afterEach(() => restoreEnv());
+  afterEach(() => {
+    servicePluginMocks.clear();
+    restoreEnv();
+  });
 
   describe('#constructor()', () => {
     it('should set the serverless instance', () => {
@@ -559,7 +560,7 @@ describe('PluginManager', () => {
       expect(pluginManager.plugins[0]).to.be.an.instanceOf(Plugin);
     });
 
-    it('should add service related plugins when provider propery is provider plugin', () => {
+    it('should add service related plugins when provider property is provider plugin', () => {
       pluginManager.serverless.service.provider.name = 'someProvider';
       class ProviderPlugin {
         static getProviderName() {
@@ -592,9 +593,9 @@ describe('PluginManager', () => {
 
   describe('#loadAllPlugins()', () => {
     beforeEach(() => {
-      mockRequire('ServicePluginMock1', ServicePluginMock1);
-      mockRequire('ServicePluginMock2', ServicePluginMock2);
-      mockRequire('BrokenPluginMock', BrokenPluginMock);
+      servicePluginMocks.set('ServicePluginMock1', ServicePluginMock1);
+      servicePluginMocks.set('ServicePluginMock2', ServicePluginMock2);
+      servicePluginMocks.set('BrokenPluginMock', BrokenPluginMock);
     });
 
     it('should load only core plugins when no service plugins are given', async () => {
@@ -634,7 +635,7 @@ describe('PluginManager', () => {
       expect(pluginIndexes).to.deep.equal(pluginIndexes.slice().sort((a, b) => a - b));
     });
 
-    it('should load the Serverless core plugins', async () => {
+    it('should load the osls core plugins', async () => {
       await pluginManager.loadAllPlugins();
 
       expect(pluginManager.plugins.length).to.be.above(1);
@@ -678,19 +679,13 @@ describe('PluginManager', () => {
         ServerlessError
       );
     });
-
-    afterEach(() => {
-      mockRequire.stop('ServicePluginMock1');
-      mockRequire.stop('ServicePluginMock2');
-      mockRequire.stop('BrokenPluginMock');
-    });
   });
 
   describe('#resolveServicePlugins()', () => {
     beforeEach(() => {
-      mockRequire('ServicePluginMock1', ServicePluginMock1);
+      servicePluginMocks.set('ServicePluginMock1', ServicePluginMock1);
       // Plugins loaded via a relative path should be required relative to the service path
-      mockRequire(`${serviceDir}/RelativePath/ServicePluginMock2`, ServicePluginMock2);
+      servicePluginMocks.set(`${serviceDir}/RelativePath/ServicePluginMock2`, ServicePluginMock2);
     });
 
     it('should resolve the service plugins', async () => {
@@ -711,11 +706,6 @@ describe('PluginManager', () => {
       // Happens when `plugins` property does not exist
       const servicePlugins = undefined;
       return expect(pluginManager.resolveServicePlugins(servicePlugins)).to.not.be.rejected;
-    });
-
-    afterEach(() => {
-      mockRequire.stop('ServicePluginMock1');
-      mockRequire.stop('ServicePluginMock2');
     });
   });
 
@@ -852,7 +842,7 @@ describe('PluginManager', () => {
         const synchronousPluginMockInstance = new SynchronousPluginMock();
         pluginManager.loadCommands(synchronousPluginMockInstance);
         expect(() => pluginManager.createCommandAlias('deploy', 'mycmd')).to.throw(
-          /Command "deploy" cannot be overriden/
+          /Command "deploy" cannot be overridden/
         );
       });
 
@@ -860,7 +850,7 @@ describe('PluginManager', () => {
         const synchronousPluginMockInstance = new SynchronousPluginMock();
         synchronousPluginMockInstance.commands.deploy.commands.onpremises.aliases = ['deploy'];
         expect(() => pluginManager.loadCommands(synchronousPluginMockInstance)).to.throw(
-          /Command "deploy" cannot be overriden/
+          /Command "deploy" cannot be overridden/
         );
       });
     });
@@ -910,6 +900,54 @@ describe('PluginManager', () => {
       expect(pluginManager.commands.deploy.commands).to.have.property('fn');
     });
 
+    it('should not mutate original plugin command definitions when merging commands', () => {
+      const firstPlugin = {
+        commands: {
+          deploy: {
+            lifecycleEvents: ['one'],
+            options: {
+              foo: {},
+            },
+            commands: {
+              fn: {
+                options: {
+                  bar: {},
+                },
+              },
+            },
+          },
+        },
+      };
+
+      const secondPlugin = {
+        commands: {
+          deploy: {
+            lifecycleEvents: ['one', 'two'],
+            options: {
+              baz: {},
+            },
+            commands: {
+              fn: {
+                options: {
+                  qux: {},
+                },
+              },
+            },
+          },
+        },
+      };
+
+      pluginManager.loadCommands(firstPlugin);
+      pluginManager.loadCommands(secondPlugin);
+
+      expect(firstPlugin.commands.deploy.options).to.deep.equal({
+        foo: {},
+      });
+      expect(firstPlugin.commands.deploy.commands.fn.options).to.deep.equal({
+        bar: {},
+      });
+    });
+
     it('should fail if there is already an alias for a command', () => {
       pluginManager.aliases = {
         deploy: {
@@ -953,8 +991,8 @@ describe('PluginManager', () => {
 
   describe('#getPlugins()', () => {
     beforeEach(() => {
-      mockRequire('ServicePluginMock1', ServicePluginMock1);
-      mockRequire('ServicePluginMock2', ServicePluginMock2);
+      servicePluginMocks.set('ServicePluginMock1', ServicePluginMock1);
+      servicePluginMocks.set('ServicePluginMock2', ServicePluginMock2);
     });
 
     it('should return all loaded plugins', async () => {
@@ -965,11 +1003,6 @@ describe('PluginManager', () => {
       expect(plugins.length).to.be.above(3);
       expect(plugins.some((plugin) => plugin instanceof ServicePluginMock1)).to.be.true;
       expect(plugins.some((plugin) => plugin instanceof ServicePluginMock2)).to.be.true;
-    });
-
-    afterEach(() => {
-      mockRequire.stop('ServicePluginMock1');
-      mockRequire.stop('ServicePluginMock2');
     });
   });
 
@@ -1314,70 +1347,94 @@ describe('PluginManager', () => {
       expect(commands).to.have.a.property('on').that.has.a.nested.property('commands.premise');
       expect(commands).to.have.a.property('premise');
     });
+
+    it('should ignore aliases whose target path misses mid-traversal', () => {
+      pluginManager.commands = {
+        deploy: {
+          key: 'deploy',
+          commands: {
+            function: {
+              key: 'deploy:function',
+              commands: {},
+            },
+          },
+        },
+        create: {
+          key: 'create',
+          commands: {},
+        },
+      };
+      pluginManager.aliases = {
+        broken: {
+          command: 'deploy:missing:create',
+        },
+      };
+
+      expect(pluginManager.getCommands()).to.not.have.property('broken');
+    });
   });
 
   describe('#getCommand()', () => {
     beforeEach(() => {
+      pluginManager.addPlugin(Create);
       pluginManager.addPlugin(SynchronousPluginMock);
-      pluginManager.serverless.cli.loadedCommands = {
-        create: {
-          usage: 'Create new Serverless service',
-          lifecycleEvents: ['create'],
-          options: {
-            template: {
-              usage: 'Template for the service. Available templates: ", "aws-nodejs", "..."',
-              shortcut: 't',
-            },
-          },
-          key: 'create',
-          pluginName: 'Create',
+    });
+
+    it('should return the current create command definition', () => {
+      const command = pluginManager.getCommand(['create']);
+
+      expect(command).to.deep.include({
+        usage: 'Create new service',
+        lifecycleEvents: ['create'],
+        key: 'create',
+        pluginName: 'Create',
+      });
+      expect(command.options).to.include.all.keys('template-url', 'template-path', 'path', 'name');
+      expect(command.options['template-url']).to.deep.include({
+        usage:
+          'Template URL for the service. Supports plain Git URLs plus GitHub, GitHub Enterprise, GitLab, Bitbucket, and Bitbucket Server.',
+        shortcut: 'u',
+      });
+      expect(command.options['template-path']).to.deep.include({
+        usage: 'Template local path for the service.',
+      });
+      expect(command.options.path).to.deep.include({
+        usage: 'The path where the service should be created (e.g. --path my-service)',
+        shortcut: 'p',
+      });
+      expect(command.options.name).to.deep.include({
+        usage:
+          'Name for the service. Overwrites the default name of the created service and is used as the target directory when --path is omitted.',
+        shortcut: 'n',
+      });
+    });
+
+    it('should return nested command definitions', () => {
+      const command = pluginManager.getCommand(['deploy', 'onpremises']);
+
+      expect(command).to.deep.include({
+        usage: 'Deploy to your On-Premises infrastructure',
+        lifecycleEvents: ['resources', 'functions'],
+        key: 'deploy:onpremises',
+        pluginName: 'SynchronousPluginMock',
+      });
+      expect(command.options).to.deep.equal({
+        resource: {
+          usage: 'The resource you want to deploy (e.g. --resource db)',
+          type: 'string',
         },
-        deploy: {
-          usage: 'Deploy a Serverless service',
-          configDependent: true,
-          lifecycleEvents: ['cleanup', 'initialize'],
-          options: {
-            conceal: {
-              usage: 'Hide secrets from the output (e.g. API Gateway key values)',
-            },
-            stage: {
-              usage: 'Stage of the service',
-              shortcut: 's',
-            },
-          },
-          key: 'deploy',
-          pluginName: 'Deploy',
-          commands: {
-            function: {
-              usage: 'Deploy a single function from the service',
-              lifecycleEvents: ['initialize', 'packageFunction', 'deploy'],
-              options: {
-                function: {
-                  usage: 'Name of the function',
-                  shortcut: 'f',
-                  required: true,
-                },
-              },
-              key: 'deploy:function',
-              pluginName: 'Deploy',
-            },
-            list: {
-              usage: 'List deployed version of your Serverless Service',
-              lifecycleEvents: ['log'],
-              key: 'deploy:list',
-              pluginName: 'Deploy',
-              commands: {
-                functions: {
-                  usage: 'List all the deployed functions and their versions',
-                  lifecycleEvents: ['log'],
-                  key: 'deploy:list:functions',
-                  pluginName: 'Deploy',
-                },
-              },
-            },
-          },
+        function: {
+          usage: 'The function you want to deploy (e.g. --function create)',
+          type: 'string',
         },
-      };
+      });
+    });
+
+    it('should throw on unrecognized commands', () => {
+      expect(() => pluginManager.getCommand(['missing'])).to.throw(ServerlessError);
+      expect(() => pluginManager.getCommand(['missing'])).to.throw(
+        'Unrecognized command "missing"'
+      );
     });
   });
 
@@ -1497,7 +1554,7 @@ describe('PluginManager', () => {
     beforeEach(() => {
       tmpDir = getTmpDirPath();
       serviceDir = path.join(tmpDir, 'service');
-      fse.mkdirsSync(serviceDir);
+      ensureDirSync(serviceDir);
       process.chdir(serviceDir);
       pluginManager.serverless.serviceDir = serviceDir;
     });
@@ -1546,8 +1603,8 @@ describe('PluginManager', () => {
     afterEach(() => {
       process.chdir(cwd);
       try {
-        fse.removeSync(tmpDir);
-      } catch (e) {
+        removeSync(tmpDir);
+      } catch {
         // Couldn't delete temporary file
       }
     });
@@ -1589,6 +1646,9 @@ describe('test/unit/lib/classes/PluginManager.test.js', () => {
     expect(typeof plugin.utils.log).to.equal('function');
     expect(typeof plugin.utils.progress.create).to.equal('function');
     expect(typeof plugin.utils.writeText).to.equal('function');
+    expect(Object.keys(plugin.utils).sort()).to.deep.equal(['log', 'progress', 'writeText']);
+    expect(plugin.utils.log.namespace).to.equal('serverless:plugin:--plugin');
+    expect(plugin.utils.log.pluginName).to.equal('./plugin');
   });
 
   it('should error out for duplicate plugin definiton', async () => {

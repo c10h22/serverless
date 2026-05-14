@@ -1,17 +1,21 @@
 'use strict';
-/* eslint-disable no-unused-expressions */
+
 const chai = require('chai');
 const sinon = require('sinon');
 const path = require('path');
 const fs = require('fs');
 const proxyquire = require('proxyquire');
+const {
+  LambdaClient,
+  GetFunctionCommand,
+  UpdateFunctionCodeCommand,
+  UpdateFunctionConfigurationCommand,
+} = require('@aws-sdk/client-lambda');
+const { IAMClient, GetRoleCommand } = require('@aws-sdk/client-iam');
 const AwsProvider = require('../../../../../lib/plugins/aws/provider');
 const Serverless = require('../../../../../lib/serverless');
 const runServerless = require('../../../../utils/run-serverless');
 const { getTmpDirPath } = require('../../../../utils/fs');
-
-chai.use(require('chai-as-promised'));
-chai.use(require('sinon-chai'));
 
 const expect = chai.expect;
 
@@ -20,7 +24,7 @@ describe('AwsDeployFunction', () => {
   let AwsDeployFunction;
   let serverless;
   let awsDeployFunction;
-  let cryptoStub;
+  let getHashForFilePathStub;
 
   beforeEach(async () => {
     serverless = new Serverless({ commands: ['print'], options: {}, serviceDir: null });
@@ -54,17 +58,9 @@ describe('AwsDeployFunction', () => {
     };
     await serverless.init();
     serverless.setProvider('aws', new AwsProvider(serverless, options));
-    cryptoStub = {
-      createHash() {
-        return this;
-      },
-      update() {
-        return this;
-      },
-      digest: sinon.stub(),
-    };
+    getHashForFilePathStub = sinon.stub();
     AwsDeployFunction = proxyquire('../../../../../lib/plugins/aws/deploy-function', {
-      crypto: cryptoStub,
+      '../../utils/get-hash-for-file-path': getHashForFilePathStub,
     });
     awsDeployFunction = new AwsDeployFunction(serverless, options);
   });
@@ -87,12 +83,12 @@ describe('AwsDeployFunction', () => {
 
     beforeEach(() => {
       getFunctionStub = sinon
-        .stub(awsDeployFunction.provider, 'request')
+        .stub(LambdaClient.prototype, 'send')
         .resolves({ func: { name: 'first' } });
     });
 
     afterEach(() => {
-      awsDeployFunction.provider.request.restore();
+      LambdaClient.prototype.send.restore();
     });
 
     it('it should throw error if function is not provided', async () => {
@@ -111,15 +107,66 @@ describe('AwsDeployFunction', () => {
       await awsDeployFunction.checkIfFunctionExists();
 
       expect(getFunctionStub.calledOnce).to.be.equal(true);
-      expect(
-        getFunctionStub.calledWithExactly('Lambda', 'getFunction', {
-          FunctionName: 'first',
-        })
-      ).to.be.equal(true);
+      expect(getFunctionStub.firstCall.args[0]).to.be.instanceOf(GetFunctionCommand);
+      expect(getFunctionStub.firstCall.args[0].input).to.deep.equal({
+        FunctionName: 'first',
+      });
       expect(awsDeployFunction.serverless.service.provider.remoteFunctionData).to.deep.equal({
         func: {
           name: 'first',
         },
+      });
+    });
+
+    it('uses an existing Lambda client promise when checking the remote function', async () => {
+      awsDeployFunction.serverless.service.functions = {
+        first: {
+          name: 'first',
+          handler: 'handler.first',
+        },
+      };
+      const send = sinon.stub().resolves({ func: { name: 'first' } });
+      const getAwsSdkV3ConfigStub = sinon
+        .stub(awsDeployFunction.provider, 'getAwsSdkV3Config')
+        .throws(new Error('Expected existing Lambda client to be reused'));
+      awsDeployFunction.lambdaClientPromise = Promise.resolve({ send });
+
+      try {
+        await awsDeployFunction.checkIfFunctionExists();
+
+        expect(getAwsSdkV3ConfigStub).to.not.have.been.called;
+        expect(send).to.have.been.calledOnce;
+        expect(send.firstCall.args[0]).to.be.instanceOf(GetFunctionCommand);
+        expect(send.firstCall.args[0].input).to.deep.equal({ FunctionName: 'first' });
+        expect(awsDeployFunction.serverless.service.provider.remoteFunctionData).to.deep.equal({
+          func: {
+            name: 'first',
+          },
+        });
+      } finally {
+        getAwsSdkV3ConfigStub.restore();
+      }
+    });
+
+    it('should translate native SDK v3 not found errors', async () => {
+      getFunctionStub.rejects(
+        Object.assign(new Error('Function not found'), {
+          name: 'ResourceNotFoundException',
+        })
+      );
+      awsDeployFunction.serverless.service.functions = {
+        first: {
+          name: 'first',
+          handler: 'handler.first',
+        },
+      };
+
+      await expect(
+        awsDeployFunction.checkIfFunctionExists()
+      ).to.eventually.be.rejected.and.have.property('code', 'FUNCTION_NOT_YET_DEPLOYED');
+      expect(getFunctionStub.firstCall.args[0]).to.be.instanceOf(GetFunctionCommand);
+      expect(getFunctionStub.firstCall.args[0].input).to.deep.equal({
+        FunctionName: 'first',
       });
     });
   });
@@ -135,8 +182,8 @@ describe('AwsDeployFunction', () => {
         .stub(awsDeployFunction.provider, 'getAccountInfo')
         .resolves({ accountId: '123456789012', partition: 'aws' });
       getRoleStub = sinon
-        .stub(awsDeployFunction.provider, 'request')
-        .resolves({ Arn: 'arn:aws:iam::123456789012:role/role_2' });
+        .stub(IAMClient.prototype, 'send')
+        .resolves({ Role: { Arn: 'arn:aws:iam::123456789012:role/role_2' } });
 
       serverless.service.resources = {
         Resources: {
@@ -152,7 +199,7 @@ describe('AwsDeployFunction', () => {
 
     afterEach(() => {
       awsDeployFunction.provider.getAccountInfo.restore();
-      awsDeployFunction.provider.request.restore();
+      IAMClient.prototype.send.restore();
       serverless.service.resources = undefined;
     });
 
@@ -174,6 +221,21 @@ describe('AwsDeployFunction', () => {
       expect(result).to.be.equal('arn:aws:iam::123456789012:role/role_123');
     });
 
+    it('should return compiled ARN if role name has a custom path', async () => {
+      serverless.service.resources.Resources.MyPathRole = {
+        Type: 'AWS::IAM::Role',
+        Properties: {
+          Path: '/service/',
+          RoleName: 'role_123',
+        },
+      };
+
+      const result = await awsDeployFunction.normalizeArnRole('MyPathRole');
+
+      expect(getAccountInfoStub).to.have.been.called;
+      expect(result).to.be.equal('arn:aws:iam::123456789012:role/service/role_123');
+    });
+
     it('should return compiled ARN if object role was provided', async () => {
       const roleObj = {
         'Fn::GetAtt': ['role_2', 'Arn'],
@@ -182,25 +244,144 @@ describe('AwsDeployFunction', () => {
       const result = await awsDeployFunction.normalizeArnRole(roleObj);
 
       expect(getRoleStub.calledOnce).to.be.equal(true);
+      expect(getRoleStub.firstCall.args[0]).to.be.instanceOf(GetRoleCommand);
+      expect(getRoleStub.firstCall.args[0].input).to.deep.equal({ RoleName: 'role_2' });
       expect(getAccountInfoStub).to.not.have.been.called;
       expect(result).to.be.equal('arn:aws:iam::123456789012:role/role_2');
+    });
+
+    it('uses an existing IAM client promise when resolving an Fn::GetAtt role', async () => {
+      const send = sinon
+        .stub()
+        .resolves({ Role: { Arn: 'arn:aws:iam::123456789012:role/role_2' } });
+      const getAwsSdkV3ConfigStub = sinon
+        .stub(awsDeployFunction.provider, 'getAwsSdkV3Config')
+        .throws(new Error('Expected existing IAM client to be reused'));
+      awsDeployFunction.iamClientPromise = Promise.resolve({ send });
+
+      try {
+        const result = await awsDeployFunction.normalizeArnRole({
+          'Fn::GetAtt': ['role_2', 'Arn'],
+        });
+
+        expect(getAwsSdkV3ConfigStub).to.not.have.been.called;
+        expect(send).to.have.been.calledOnce;
+        expect(send.firstCall.args[0]).to.be.instanceOf(GetRoleCommand);
+        expect(send.firstCall.args[0].input).to.deep.equal({ RoleName: 'role_2' });
+        expect(getAccountInfoStub).to.not.have.been.called;
+        expect(result).to.equal('arn:aws:iam::123456789012:role/role_2');
+      } finally {
+        getAwsSdkV3ConfigStub.restore();
+      }
+    });
+  });
+
+  describe('#ensureFunctionState()', () => {
+    let getFunctionStub;
+
+    beforeEach(() => {
+      serverless.service.functions.first.name = 'first';
+      getFunctionStub = sinon.stub(LambdaClient.prototype, 'send').resolves({
+        Configuration: {
+          State: 'Pending',
+          LastUpdateStatus: 'InProgress',
+        },
+      });
+      sinon
+        .stub(Date, 'now')
+        .onFirstCall()
+        .returns(0)
+        .onSecondCall()
+        .returns(60 * 1000 + 1);
+    });
+
+    afterEach(() => {
+      LambdaClient.prototype.send.restore();
+      Date.now.restore();
+    });
+
+    it('should time out while waiting for desired function state', async () => {
+      await expect(
+        awsDeployFunction.ensureFunctionState()
+      ).to.eventually.be.rejected.and.have.property(
+        'code',
+        'DEPLOY_FUNCTION_ENSURE_STATE_TIMED_OUT'
+      );
+      expect(getFunctionStub.calledOnce).to.equal(true);
+      expect(getFunctionStub.firstCall.args[0]).to.be.instanceOf(GetFunctionCommand);
+      expect(getFunctionStub.firstCall.args[0].input).to.deep.equal({ FunctionName: 'first' });
+    });
+  });
+
+  describe('#callUpdateFunctionConfiguration()', () => {
+    let updateFunctionConfigurationStub;
+
+    beforeEach(() => {
+      updateFunctionConfigurationStub = sinon.stub(LambdaClient.prototype, 'send').rejects(
+        Object.assign(new Error('configuration update conflict'), {
+          name: 'ResourceConflictException',
+        })
+      );
+      sinon
+        .stub(Date, 'now')
+        .onFirstCall()
+        .returns(0)
+        .onSecondCall()
+        .returns(60 * 1000 + 1);
+    });
+
+    afterEach(() => {
+      LambdaClient.prototype.send.restore();
+      Date.now.restore();
+    });
+
+    it('should time out retryable configuration update conflicts', async () => {
+      await expect(
+        awsDeployFunction.callUpdateFunctionConfiguration({ FunctionName: 'first' })
+      ).to.eventually.be.rejected.and.have.property(
+        'code',
+        'DEPLOY_FUNCTION_CONFIGURATION_UPDATE_TIMED_OUT'
+      );
+      expect(updateFunctionConfigurationStub.calledOnce).to.equal(true);
+    });
+
+    it('should surface non-conflict configuration update errors without retrying', async () => {
+      const updateError = Object.assign(new Error('access denied'), {
+        name: 'AccessDeniedException',
+      });
+      updateFunctionConfigurationStub.rejects(updateError);
+
+      try {
+        await awsDeployFunction.callUpdateFunctionConfiguration({ FunctionName: 'first' });
+      } catch (error) {
+        expect(error).to.equal(updateError);
+        expect(updateFunctionConfigurationStub.calledOnce).to.equal(true);
+        expect(updateFunctionConfigurationStub.firstCall.args[0]).to.be.instanceOf(
+          UpdateFunctionConfigurationCommand
+        );
+        expect(updateFunctionConfigurationStub.firstCall.args[0].input).to.deep.equal({
+          FunctionName: 'first',
+        });
+        return;
+      }
+
+      throw new Error('Expected callUpdateFunctionConfiguration to reject');
     });
   });
 
   describe('#deployFunction()', () => {
     let artifactFilePath;
     let updateFunctionCodeStub;
-    let statSyncStub;
-    let readFileSyncStub;
+    let readFileStub;
 
     beforeEach(() => {
       // write a file to disc to simulate that the deployment artifact exists
       awsDeployFunction.packagePath = getTmpDirPath();
       artifactFilePath = path.join(awsDeployFunction.packagePath, 'first.zip');
       serverless.utils.writeFileSync(artifactFilePath, 'first.zip file content');
-      updateFunctionCodeStub = sinon.stub(awsDeployFunction.provider, 'request').resolves();
-      statSyncStub = sinon.stub(fs, 'statSync').returns({ size: 1024 });
-      readFileSyncStub = sinon.stub(fs, 'readFileSync').returns();
+      updateFunctionCodeStub = sinon.stub(LambdaClient.prototype, 'send').resolves();
+      readFileStub = sinon.stub(fs.promises, 'readFile').resolves(Buffer.from('first.zip content'));
+      getHashForFilePathStub.resolves('local-hash-zip-file');
       awsDeployFunction.serverless.service.provider.remoteFunctionData = {
         Configuration: {
           CodeSha256: 'remote-hash-zip-file',
@@ -209,65 +390,58 @@ describe('AwsDeployFunction', () => {
     });
 
     afterEach(() => {
-      awsDeployFunction.provider.request.restore();
-      fs.statSync.restore();
-      fs.readFileSync.restore();
+      LambdaClient.prototype.send.restore();
+      fs.promises.readFile.restore();
     });
 
     it('should deploy the function if the hashes are different', async () => {
-      cryptoStub.createHash().update().digest.onCall(0).returns('local-hash-zip-file');
+      const data = Buffer.from('first.zip content');
+      readFileStub.resolves(data);
 
       await awsDeployFunction.deployFunction();
 
-      const data = fs.readFileSync(artifactFilePath);
       expect(updateFunctionCodeStub.calledOnce).to.be.equal(true);
-      expect(readFileSyncStub.called).to.equal(true);
-      expect(
-        updateFunctionCodeStub.calledWithExactly('Lambda', 'updateFunctionCode', {
-          FunctionName: 'first',
-          ZipFile: data,
-        })
-      ).to.be.equal(true);
-      expect(readFileSyncStub.calledWithExactly(artifactFilePath)).to.equal(true);
+      expect(getHashForFilePathStub).to.have.been.calledWithExactly(artifactFilePath);
+      expect(readFileStub).to.have.been.calledWithExactly(artifactFilePath);
+      expect(updateFunctionCodeStub.firstCall.args[0]).to.be.instanceOf(UpdateFunctionCodeCommand);
+      expect(updateFunctionCodeStub.firstCall.args[0].input).to.deep.equal({
+        FunctionName: 'first',
+        ZipFile: data,
+      });
     });
 
     it('should deploy the function if the hashes are same but the "force" option is used', async () => {
       awsDeployFunction.options.force = true;
-      cryptoStub.createHash().update().digest.onCall(0).returns('remote-hash-zip-file');
+      const data = Buffer.from('first.zip content');
+      readFileStub.resolves(data);
 
       await awsDeployFunction.deployFunction();
-      const data = fs.readFileSync(artifactFilePath);
 
       expect(updateFunctionCodeStub.calledOnce).to.be.equal(true);
-      expect(readFileSyncStub.called).to.equal(true);
-      expect(
-        updateFunctionCodeStub.calledWithExactly('Lambda', 'updateFunctionCode', {
-          FunctionName: 'first',
-          ZipFile: data,
-        })
-      ).to.be.equal(true);
-      expect(readFileSyncStub.calledWithExactly(artifactFilePath)).to.equal(true);
+      expect(getHashForFilePathStub).to.not.have.been.called;
+      expect(readFileStub).to.have.been.calledWithExactly(artifactFilePath);
+      expect(updateFunctionCodeStub.firstCall.args[0]).to.be.instanceOf(UpdateFunctionCodeCommand);
+      expect(updateFunctionCodeStub.firstCall.args[0].input).to.deep.equal({
+        FunctionName: 'first',
+        ZipFile: data,
+      });
     });
 
     it('should resolve if the hashes are the same', async () => {
-      cryptoStub.createHash().update().digest.onCall(0).returns('remote-hash-zip-file');
+      getHashForFilePathStub.resolves('remote-hash-zip-file');
 
       await awsDeployFunction.deployFunction();
 
       expect(updateFunctionCodeStub.calledOnce).to.be.equal(false);
-      expect(readFileSyncStub.calledOnce).to.equal(true);
-      expect(readFileSyncStub.calledWithExactly(artifactFilePath)).to.equal(true);
+      expect(getHashForFilePathStub).to.have.been.calledWithExactly(artifactFilePath);
+      expect(readFileStub).to.not.have.been.called;
     });
 
     it('should log artifact size', async () => {
-      // awnY7Oi280gp5kTCloXzsqJCO4J766x6hATWqQsN/uM= <-- hash of the local zip file
-      readFileSyncStub.returns(Buffer.from('my-service.zip content'));
-
       await awsDeployFunction.deployFunction();
 
-      expect(readFileSyncStub.calledOnce).to.equal(true);
-      expect(statSyncStub.calledOnce).to.equal(true);
-      expect(readFileSyncStub.calledWithExactly(artifactFilePath)).to.equal(true);
+      expect(readFileStub.calledOnce).to.equal(true);
+      expect(readFileStub.calledWithExactly(artifactFilePath)).to.equal(true);
     });
 
     describe('when artifact is provided', () => {
@@ -288,20 +462,22 @@ describe('AwsDeployFunction', () => {
       });
 
       it('should read the provided artifact', async () => {
+        const data = Buffer.from('artifact.zip content');
+        readFileStub.resolves(data);
+
         await awsDeployFunction.deployFunction();
 
-        const data = fs.readFileSync(artifactZipFile);
-
-        expect(readFileSyncStub).to.have.been.calledWithExactly(artifactZipFile);
-        expect(statSyncStub).to.have.been.calledWithExactly(artifactZipFile);
+        expect(getHashForFilePathStub).to.have.been.calledWithExactly(artifactZipFile);
+        expect(readFileStub).to.have.been.calledWithExactly(artifactZipFile);
         expect(getFunctionStub).to.have.been.calledWithExactly('first');
         expect(updateFunctionCodeStub.calledOnce).to.equal(true);
-        expect(
-          updateFunctionCodeStub.calledWithExactly('Lambda', 'updateFunctionCode', {
-            FunctionName: 'first',
-            ZipFile: data,
-          })
-        ).to.be.equal(true);
+        expect(updateFunctionCodeStub.firstCall.args[0]).to.be.instanceOf(
+          UpdateFunctionCodeCommand
+        );
+        expect(updateFunctionCodeStub.firstCall.args[0].input).to.deep.equal({
+          FunctionName: 'first',
+          ZipFile: data,
+        });
       });
     });
   });
@@ -370,7 +546,7 @@ describe('test/unit/lib/plugins/aws/deployFunction.test.js', () => {
   });
 
   it('should support updating function with image config', async () => {
-    await runServerless({
+    const { awsSdkV3Stub, serverless } = await runServerless({
       fixture: 'function',
       command: 'deploy function',
       options: { function: 'foo' },
@@ -396,6 +572,12 @@ describe('test/unit/lib/plugins/aws/deployFunction.test.js', () => {
       EntryPoint: ['executable', 'param1'],
       WorkingDirectory: './workdir',
     });
+    const expectedCredentials = serverless.getProvider('aws').getAwsSdkV3CredentialsProvider();
+    expect(
+      awsSdkV3Stub.sends
+        .filter(({ service }) => service === 'Lambda')
+        .every(({ clientConfig }) => clientConfig.credentials === expectedCredentials)
+    ).to.equal(true);
   });
 
   it('should skip updating function configuration if image config did not change', async () => {
@@ -440,6 +622,42 @@ describe('test/unit/lib/plugins/aws/deployFunction.test.js', () => {
       },
     });
     expect(updateFunctionConfigurationStub).not.to.be.called;
+  });
+
+  it('should treat null remote image config as different from an empty local image config', async () => {
+    await runServerless({
+      fixture: 'function',
+      command: 'deploy function',
+      options: { function: 'basic' },
+      awsRequestStubMap: {
+        ...awsRequestStubMap,
+        Lambda: {
+          ...awsRequestStubMap.Lambda,
+          getFunction: {
+            Configuration: {
+              LastModified: '2020-05-20T15:34:16.494+0000',
+              CodeSha256: imageSha,
+              State: 'Active',
+              LastUpdateStatus: 'Successful',
+              ImageConfigResponse: {
+                ImageConfig: null,
+              },
+            },
+          },
+        },
+      },
+      configExt: {
+        functions: {
+          basic: {
+            image: imageWithSha,
+          },
+        },
+      },
+    });
+
+    expect(updateFunctionCodeStub).not.to.be.called;
+    expect(updateFunctionConfigurationStub).to.be.calledOnce;
+    expect(updateFunctionConfigurationStub.args[0][0].ImageConfig).to.deep.equal({});
   });
 
   it('should skip deployment if image sha did not change', async () => {
@@ -537,7 +755,11 @@ describe('test/unit/lib/plugins/aws/deployFunction.test.js', () => {
     const innerUpdateFunctionConfigurationStub = sinon
       .stub()
       .onFirstCall()
-      .throws({ providerError: { code: 'ResourceConflictException' } })
+      .throws(
+        Object.assign(new Error('configuration update conflict'), {
+          name: 'ResourceConflictException',
+        })
+      )
       .onSecondCall()
       .resolves({});
     await runServerless({
@@ -552,7 +774,7 @@ describe('test/unit/lib/plugins/aws/deployFunction.test.js', () => {
         },
       },
       modulesCacheStub: {
-        'timers-ext/promise/sleep': sinon.stub().returns({}),
+        [path.resolve(__dirname, '../../../../../lib/utils/sleep.js')]: sinon.stub().resolves(),
       },
       configExt: {
         functions: {
@@ -1155,6 +1377,48 @@ describe('test/unit/lib/plugins/aws/deployFunction.test.js', () => {
     });
   });
 
+  it('should pass credential provider unchanged when resolving IAM role references', async () => {
+    const { awsSdkV3Stub, serverless } = await runServerless({
+      fixture: 'function',
+      command: 'deploy function',
+      options: { function: 'basic' },
+      awsRequestStubMap: {
+        ...awsRequestStubMap,
+        IAM: {
+          getRole: { Role: { Arn: role } },
+        },
+        Lambda: {
+          ...awsRequestStubMap.Lambda,
+          getFunction: {
+            Configuration: {
+              LastModified: '2020-05-20T15:34:16.494+0000',
+              PackageType: 'Zip',
+              State: 'Active',
+              LastUpdateStatus: 'Successful',
+            },
+          },
+        },
+      },
+      configExt: {
+        functions: {
+          basic: {
+            name: functionName,
+            role: { 'Fn::GetAtt': ['CustomRole', 'Arn'] },
+          },
+        },
+      },
+    });
+
+    const getRoleSend = awsSdkV3Stub.sends.find(
+      ({ service, method }) => service === 'IAM' && method === 'getRole'
+    );
+
+    expect(getRoleSend.input).to.deep.equal({ RoleName: 'CustomRole' });
+    expect(getRoleSend.clientConfig.credentials).to.equal(
+      serverless.getProvider('aws').getAwsSdkV3CredentialsProvider()
+    );
+  });
+
   it('should not update function configuration if configuration did not change', async () => {
     await runServerless({
       fixture: 'function',
@@ -1534,9 +1798,7 @@ describe('test/unit/lib/plugins/aws/deployFunction.test.js', () => {
             ...awsRequestStubMap.Lambda,
             getFunction: () => {
               throw Object.assign(new Error('Function not found'), {
-                providerError: {
-                  code: 'ResourceNotFoundException',
-                },
+                name: 'ResourceNotFoundException',
               });
             },
           },

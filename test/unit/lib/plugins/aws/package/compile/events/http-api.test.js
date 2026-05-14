@@ -3,8 +3,6 @@
 const chai = require('chai');
 const runServerless = require('../../../../../../../utils/run-serverless');
 
-chai.use(require('chai-as-promised'));
-
 const { expect } = chai;
 
 describe('lib/plugins/aws/package/compile/events/httpApi.test.js', () => {
@@ -19,6 +17,21 @@ describe('lib/plugins/aws/package/compile/events/httpApi.test.js', () => {
       expect(cfResources[naming.getHttpApiLogicalId()]).to.equal();
       expect(cfResources[naming.getHttpApiStageLogicalId()]).to.equal();
     }));
+
+  it('defines compiler methods as lazy non-enumerable descriptors', async () => {
+    const { serverless } = await runServerless({
+      fixture: 'http-api',
+      command: 'package',
+    });
+    const plugin = serverless.httpApiEventsPlugin;
+
+    for (const name of ['resolveConfiguration', 'compileIntegration', 'compileLambdaPermissions']) {
+      const descriptor = Object.getOwnPropertyDescriptor(plugin.constructor.prototype, name);
+
+      expect(descriptor).to.include({ enumerable: false, configurable: true });
+      expect(descriptor.get).to.be.a('function');
+    }
+  });
 
   describe('Basic configuration', () => {
     let cfResources;

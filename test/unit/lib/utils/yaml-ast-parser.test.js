@@ -1,14 +1,11 @@
 'use strict';
 
 const path = require('path');
-const chai = require('chai');
 const writeFileSync = require('../../../../lib/utils/fs/write-file-sync');
 const readFileSync = require('../../../../lib/utils/fs/read-file-sync');
 const yamlAstParser = require('../../../../lib/utils/yaml-ast-parser');
-const chaiAsPromised = require('chai-as-promised');
 const { getTmpDirPath } = require('../../../utils/fs');
 
-chai.use(chaiAsPromised);
 const expect = require('chai').expect;
 
 describe('#yamlAstParser', () => {
@@ -166,6 +163,23 @@ describe('#yamlAstParser', () => {
       return addNewArrayItemAndVerifyResult(yamlContent, 'toplevel', 'foo', expectedResult);
     });
 
+    it('should add an item under a quoted top level key', () => {
+      const yamlContent = [
+        '"plugins":',
+        '  - existing-plugin',
+        'custom:',
+        '  taggedValue: keep-me',
+      ].join('\n');
+      const expectedResult = {
+        plugins: ['existing-plugin', 'foo'],
+        custom: {
+          taggedValue: 'keep-me',
+        },
+      };
+
+      return addNewArrayItemAndVerifyResult(yamlContent, 'plugins', 'foo', expectedResult);
+    });
+
     it('should survive with invalid yaml', () => {
       const yamlContent = 'service:';
       const expectedResult = { service: null, toplevel: ['foo'] };
@@ -305,7 +319,7 @@ describe('#yamlAstParser', () => {
 
     it('should do nothing when you can not find the object which you specify', () => {
       const yamlContent = {
-        serveice: 'test-service',
+        service: 'test-service',
         toplevel: ['foo', 'bar'],
       };
 
@@ -325,6 +339,69 @@ describe('#yamlAstParser', () => {
         'bar',
         expectedResult
       );
+    });
+
+    it('preserves sibling properties after removing the last nested array item', () => {
+      const yamlContent = [
+        'plugins:',
+        '  modules:',
+        '    - foo',
+        '  localPath: ./.serverless_plugins',
+        'custom:',
+        '  taggedValue: keep-me',
+      ].join('\n');
+      const expectedResult = {
+        plugins: {
+          localPath: './.serverless_plugins',
+        },
+        custom: {
+          taggedValue: 'keep-me',
+        },
+      };
+
+      return removeExistingArrayItemAndVerifyResult(
+        yamlContent,
+        'plugins.modules',
+        'foo',
+        expectedResult
+      );
+    });
+
+    it('preserves quoted top level keys when removing the last nested array item', () => {
+      const yamlContent = [
+        '"plugins":',
+        '  modules:',
+        '    - foo',
+        '  localPath: ./.serverless_plugins',
+        'custom:',
+        '  taggedValue: keep-me',
+      ].join('\n');
+      const expectedResult = {
+        plugins: {
+          localPath: './.serverless_plugins',
+        },
+        custom: {
+          taggedValue: 'keep-me',
+        },
+      };
+
+      return removeExistingArrayItemAndVerifyResult(
+        yamlContent,
+        'plugins.modules',
+        'foo',
+        expectedResult
+      );
+    });
+
+    it('should remove NaN values from arrays', () => {
+      const yamlContent = {
+        toplevel: [NaN, 'bar', NaN],
+      };
+      const expectedResult = {
+        toplevel: ['bar'],
+      };
+
+      return removeExistingArrayItemAndVerifyResult(yamlContent, 'toplevel', NaN, expectedResult);
     });
   });
 });

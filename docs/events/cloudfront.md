@@ -17,13 +17,13 @@ Lambda@Edge has four options when the Lambda function is triggered
 
 **NOTE:** Deployments and removals can take up to 30 minutes due to the CloudFront CDN propagation.
 
-**IMPORTANT:** Due to current [Lambda@Edge limitations](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/lambda-edge-delete-replicas.html) it's necessary to set the `DeletionPolicy` to `Retain` for AWS Lambda functions which use the `cloudFront` event. The Serverless Framework will do this automatically for you. However bear in mind that **you have to delete those AWS Lambda functions manually** once you've removed the service via `serverless remove`.
+**IMPORTANT:** Due to current [Lambda@Edge limitations](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/lambda-edge-delete-replicas.html) it's necessary to set the `DeletionPolicy` to `Retain` for AWS Lambda functions which use the `cloudFront` event. osls will do this automatically for you. However bear in mind that **you have to delete those AWS Lambda functions manually** once you've removed the service via `serverless remove`.
 
 **MEMORY AND TIMEOUT LIMITS:** According to [AWS Limits on Lambda@Edge](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/cloudfront-limits.html#limits-lambda-at-edge) the limits for viewer-request and viewer-response are 128MB memory and 5 seconds timeout and for origin-request and origin-response are 3008MB memory and 30 seconds timeout.
 
-**RUNTIME LIMITS:** According to [AWS Requirements on Lambda@Edge](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/lambda-requirements-limits.html) the runtimes supported by Lambda@Edge functions are: `Python 3.9`, `Python 3.8`, `Python 3.7`, `Node.js 16.x`, `Node.js 14.x`, `Node.js 12.x`, `Node.js 10.x`.
+**RUNTIME LIMITS:** According to [AWS Requirements on Lambda@Edge](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/lambda-requirements-limits.html) Lambda@Edge supports only a subset of Lambda runtimes. See the AWS documentation for the current supported runtimes.
 
-**FUNCTION SIZE LIMITS:** According to [AWS Quotas on CloudFront](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/cloudfront-limits.html#limits-functions), Lambda@Edge functions mustn't exceed the maximum size of 10KB. An easy way of reducing the size of a function is through bundling and minification via e.g. the plugin [serverless-esbuild](https://www.example.com/plugins/serverless-esbuild).
+**FUNCTION SIZE LIMITS:** According to [AWS Requirements on Lambda@Edge](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/lambda-requirements-limits.html) Lambda@Edge functions must stay within the current Lambda@Edge deployment package size quotas.
 
 ## Simple event definition
 
@@ -45,13 +45,13 @@ Example handler function that returns timestamp in the response headers. More ex
 // index.handler
 'use strict';
 
-module.exports.handler = (event, context, callback) => {
+module.exports.handler = (event) => {
   const response = event.Records[0].cf.response;
   const headers = response.headers;
 
   headers['x-serverless-time'] = [{ key: 'x-serverless-time', value: Date.now().toString() }];
 
-  return callback(null, response);
+  return response;
 };
 ```
 
@@ -226,7 +226,7 @@ functions:
             id: 658327ea-f89d-4fab-a63d-7e88639e58f6 # references AWS Managed Policy named Managed-CachingOptimized
 ```
 
-It is also possible to reference policies with `behavior.CachePolicyId` property. When both `cachePolicy.id` and `behavior.CachePolicyId` are specified, setting from `cachePolicy.id` will be used. Similarily, when `cachePolicy.name` and `behavior.CachePolicyId` are specified, setting from `cachePolicy.name` will be used.
+It is also possible to reference policies with `behavior.CachePolicyId` property. When both `cachePolicy.id` and `behavior.CachePolicyId` are specified, setting from `cachePolicy.id` will be used. Similarly, when `cachePolicy.name` and `behavior.CachePolicyId` are specified, setting from `cachePolicy.name` will be used.
 
 ```yml
 functions:

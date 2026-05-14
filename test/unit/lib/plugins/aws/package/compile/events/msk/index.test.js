@@ -5,8 +5,6 @@ const runServerless = require('../../../../../../../../utils/run-serverless');
 
 const { expect } = chai;
 
-chai.use(require('chai-as-promised'));
-
 describe('AwsCompileMSKEvents', () => {
   const arn = 'arn:aws:kafka:us-east-1:111111111111:cluster/ClusterName/a1a1a1a1a1a1a1a1a';
   const topic = 'TestingTopic';
@@ -121,7 +119,7 @@ describe('AwsCompileMSKEvents', () => {
       expect(allParamsEventSourceMappingResource.DependsOn).to.include('IamRoleLambdaExecution');
     });
 
-    it('should correctly complie EventSourceMapping resource with all parameters', () => {
+    it('should correctly compile EventSourceMapping resource with all parameters', () => {
       expect(allParamsEventSourceMappingResource.Properties).to.deep.equal({
         BatchSize: batchSize,
         MaximumBatchingWindowInSeconds: maximumBatchingWindow,

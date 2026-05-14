@@ -1,6 +1,8 @@
-**The Serverless Framework** – Build applications on AWS Lambda and other next-gen cloud services, that auto-scale and only charge you when they run. This lowers the total cost of running and operating your apps, enabling you to build more and manage less.
+**osls** – Build applications on AWS Lambda and other next-gen cloud services, that auto-scale and only charge you when they run. This lowers the total cost of running and operating your apps, enabling you to build more and manage less.
 
-The Serverless Framework is a command-line tool with an easy and approachable YAML syntax to deploy both your code and cloud infrastructure needed to make tons of serverless application use-cases. It's a multi-language framework that supports Node.js, Typescript, Python, Go, Java, and more.
+osls is a command-line tool with an easy and approachable YAML syntax to deploy both your code and cloud infrastructure needed to make tons of serverless application use-cases. It's a multi-language framework that supports Node.js, Typescript, Python, Go, Java, and more.
+
+osls is short for Open Serverless.
 
 ---
 
@@ -10,21 +12,27 @@ This repository is a maintained alternative to [Serverless Framework](https://gi
 
 <p align="center">
 <a href="https://www.voxie.com/"><img src="docs/sponsors/voxie.svg" width="150px" /></a>
-&nbsp; &nbsp; &nbsp; &nbsp;
-<a href="https://optionmetrics.com/"><img src="docs/sponsors/optionmetrics.png" width="300px" /></a>
-&nbsp; &nbsp; &nbsp; &nbsp;
-<a href="https://www.mybuilder.com/"><img src="docs/sponsors/mybuilder.svg" width="210px" /></a>
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;
+<a href="https://www.flagsmith.com/"><img src="docs/sponsors/flagsmith.png" height="50px" /></a>
+</p>
+
+<p align="center">
+<a href="https://www.mybuilder.com/"><img src="docs/sponsors/mybuilder.svg" height="40px" /></a>
+&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;
+<a href="https://optionmetrics.com/"><img src="docs/sponsors/optionmetrics.png" height="50px" /></a>
 </p>
 
 This project is open-source and free to use. However, maintaining it requires time and effort. If you want to support the project, you can become a sponsor on GitHub Sponsors.
 
 ## Installation
 
+Requires Node.js `^20.19.0 || ^22.13.0 || >=24`.
+
 ```sh
 npm remove -g serverless
 npm install -g osls
 
-serverless --version
+osls --version
 ```
 
 The repository has been created and is maintained by [Bref](https://bref.sh) maintainers and contributors. The main goal of this repository is to provide continuity for Bref users, so that these Bref projects keep working for the next 5 years. No major new features are planned. However, community contributions to keep the project running (even for languages other than PHP), like adding support to new runtime versions, adapting to AWS changes, bugfixes, and other small improvements are welcome.
@@ -125,7 +133,6 @@ This repository contains the following differences with the original Serverless 
 
 ## Learn More
 
-- [Upgrading to v3](./docs/guides/upgrading-v3.md)
 - [Configuration Validation](./docs/guides/configuration-validation.md)
 - [Resolution of Environment Variables](./docs/guides/environment-variables.md)
 - [Deprecations](./docs/guides/deprecations.md)
